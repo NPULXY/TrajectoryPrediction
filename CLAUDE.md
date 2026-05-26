@@ -1,5 +1,7 @@
 # CLAUDE.md
 
+> GitHub: <https://github.com/NPULXY/TrajectoryPrediction>
+
 ## 项目概述
 
 航天器相对运动轨迹预测项目。使用 LSTM Encoder-Decoder 模型，
