@@ -23,22 +23,21 @@ TEST_RATIO = 0.15               # 测试集比例
 RANDOM_SEED = 42                # 随机种子
 
 # ==================== 模型配置 ====================
-D_MODEL = 128                   # Transformer 隐层维度
-NHEAD = 8                       # 多头注意力头数
-NUM_ENCODER_LAYERS = 4          # Encoder 层数
-NUM_DECODER_LAYERS = 2          # Decoder 层数
-DIM_FEEDFORWARD = 512           # 前馈网络维度
-DROPOUT = 0.1                   # Dropout 概率
-USE_DECODER = True              # 是否使用 Transformer Decoder（否则直接回归）
+D_MODEL = 256                   # LSTM 隐层维度
+NUM_LSTM_LAYERS = 3             # LSTM 层数
+NHEAD = 8                       # 多头注意力头数（仅 Transformer 使用）
+NUM_ENCODER_LAYERS = 4          # Encoder 层数（仅 Transformer 使用）
+DIM_FEEDFORWARD = 512           # 前馈网络维度（仅 Transformer 使用）
+DROPOUT = 0.15                  # Dropout 概率
 
 # ==================== 训练配置 ====================
-BATCH_SIZE = 64                 # 批大小
-LEARNING_RATE = 1e-3            # 初始学习率
+BATCH_SIZE = 128                # 批大小
+LEARNING_RATE = 1e-3            # 峰值学习率
+MIN_LR = 1e-6                   # 最小学习率
 WEIGHT_DECAY = 1e-5             # 权重衰减
-EPOCHS = 200                    # 最大训练轮数
-EARLY_STOP_PATIENCE = 20        # 早停耐心值
-LR_REDUCE_FACTOR = 0.5          # 学习率衰减因子
-LR_REDUCE_PATIENCE = 10         # 学习率衰减耐心值
+EPOCHS = 300                    # 最大训练轮数
+EARLY_STOP_PATIENCE = 50        # 早停耐心值
+WARMUP_EPOCHS = 5               # 学习率 warmup 轮数
 
 # ==================== 特征索引（用于分项评估） ====================
 def _make_pos_vel_indices():

@@ -236,6 +236,32 @@ def masked_mse_loss(pred, target, mask):
     return diff[mask_expanded].mean()
 
 
+def masked_step_weighted_loss(pred, target, mask, power=1.0):
+    """
+    步长加权 MSE 损失：后期时间步权重更高。
+
+    Args:
+        pred, target: (B, 10, max_dim)
+        mask:         (B, max_dim) bool
+        power:        权重增长指数（越大后期步权重越高，0 = 等权）
+
+    Returns:
+        标量损失
+    """
+    # 步长权重: step 1..10 → 0.1..1.0
+    B = pred.shape[0]
+    step_weights = torch.linspace(0.1, 1.0, 10, device=pred.device) ** power  # (10,)
+    step_weights = step_weights.unsqueeze(0).unsqueeze(-1)  # (1, 10, 1)
+
+    mask_expanded = mask.unsqueeze(1).expand_as(pred)  # (B, 10, max_dim)
+    diff = (pred - target) ** 2
+
+    # 加权平均
+    weighted_diff = diff * step_weights
+    total_weight = mask_expanded.float() * step_weights
+    return weighted_diff[mask_expanded].sum() / total_weight[mask_expanded].sum()
+
+
 def compute_metrics(pred, target, mask):
     """
     计算整体及分项（位置/速度）的 MSE、MAE、RMSE。

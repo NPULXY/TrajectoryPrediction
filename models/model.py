@@ -1,160 +1,168 @@
 """
-Transformer 时序预测模型。
-支持 Encoder-Only（直接回归）和 Encoder-Decoder 两种模式。
+轨迹预测模型：LSTM Encoder-Decoder + 残差连接。
+Encoder 将 10 步输入编码为隐状态，Decoder 自回归生成 10 步修正量（delta），
+最终预测 = 持久预测 + delta，保证至少等于朴素基线。
 """
 
 import torch
 import torch.nn as nn
-import math
 
 from config import (
     MAX_DIM, INPUT_STEPS, OUTPUT_STEPS,
-    D_MODEL, NHEAD, NUM_ENCODER_LAYERS, NUM_DECODER_LAYERS,
-    DIM_FEEDFORWARD, DROPOUT, USE_DECODER
+    D_MODEL, DROPOUT,
 )
 
 
-class PositionalEncoding(nn.Module):
-    """正弦位置编码（用于无学习参数时的备选方案）。"""
-
-    def __init__(self, d_model, max_len=20, dropout=0.1):
-        super().__init__()
-        self.dropout = nn.Dropout(p=dropout)
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(
-            torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
-        )
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe.unsqueeze(0))
-
-    def forward(self, x):
-        """x: (B, T, D)"""
-        x = x + self.pe[:, :x.shape[1], :]
-        return self.dropout(x)
-
-
-class TrajectoryTransformer(nn.Module):
+class TrajectoryLSTM(nn.Module):
     """
-    轨迹预测 Transformer 模型。
+    LSTM Encoder-Decoder 轨迹预测模型。
 
-    输入:  (batch, 10, max_dim) 观测序列
-    输出:  (batch, 10, max_dim) 预测序列
+    输入:  (B, 10, max_dim) 观测序列
+    输出:  (B, 10, max_dim) 预测序列
     """
 
     def __init__(
         self,
         input_dim=MAX_DIM,
-        d_model=D_MODEL,
-        nhead=NHEAD,
-        num_encoder_layers=NUM_ENCODER_LAYERS,
-        num_decoder_layers=NUM_DECODER_LAYERS,
-        dim_feedforward=DIM_FEEDFORWARD,
+        hidden_size=D_MODEL,
+        num_layers=3,
         dropout=DROPOUT,
-        use_decoder=USE_DECODER,
     ):
         super().__init__()
         self.input_dim = input_dim
-        self.d_model = d_model
-        self.use_decoder = use_decoder
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
 
-        # 输入投影：将 max_dim 维特征映射到 d_model
-        self.input_proj = nn.Linear(input_dim, d_model)
-
-        # 可学习位置编码（针对 10 个输入时间步）
-        self.src_pos_encoding = nn.Parameter(
-            torch.randn(1, INPUT_STEPS, d_model) * 0.02
-        )
-        if use_decoder:
-            self.tgt_pos_encoding = nn.Parameter(
-                torch.randn(1, OUTPUT_STEPS, d_model) * 0.02
-            )
-
-        # Transformer Encoder
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model,
-            nhead=nhead,
-            dim_feedforward=dim_feedforward,
-            dropout=dropout,
+        # ── Encoder LSTM ──
+        self.encoder_lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
             batch_first=True,
-            activation="gelu",
         )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_encoder_layers)
 
-        # Transformer Decoder（可选）
-        if use_decoder:
-            decoder_layer = nn.TransformerDecoderLayer(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                batch_first=True,
-                activation="gelu",
-            )
-            self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+        # ── Decoder LSTM ──
+        self.decoder_lstm = nn.LSTM(
+            input_size=input_dim + hidden_size,  # concat(prev_delta, context)
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout if num_layers > 1 else 0,
+            batch_first=True,
+        )
 
-        # 输出头
-        self.output_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
+        # ── 上下文向量投影（从 encoder 最终状态生成） ──
+        self.context_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+        )
+
+        # ── 初始 decoder 输入：从 encoder 最后隐状态预测第一步 delta ──
+        self.init_delta = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model, input_dim),
+            nn.Linear(hidden_size, input_dim),
+        )
+
+        # ── Decoder 输出 → delta ──
+        self.output_proj = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, input_dim),
         )
 
         self._init_weights()
 
     def _init_weights(self):
-        for p in self.parameters():
-            if p.dim() > 1:
+        for name, p in self.named_parameters():
+            if "lstm" in name:
+                if "weight_ih" in name:
+                    nn.init.xavier_uniform_(p)
+                elif "weight_hh" in name:
+                    nn.init.orthogonal_(p)
+                elif "bias" in name:
+                    p.data.fill_(0)
+                    n = p.size(0)
+                    p.data[n // 4: n // 2].fill_(1)  # forget gate
+            elif p.dim() > 1:
                 nn.init.xavier_uniform_(p)
             elif p.dim() == 1:
                 nn.init.zeros_(p)
 
-    def forward(self, x):
+    def forward(self, x, target=None, teacher_forcing_ratio=0.0):
         """
         Args:
-            x: (B, 10, max_dim) 观测序列
+            x:      (B, 10, max_dim) 观测序列
+            target: (B, 10, max_dim) 目标序列（仅 teacher forcing 时需要）
+            teacher_forcing_ratio: teacher forcing 概率
 
         Returns:
             (B, 10, max_dim) 未来预测序列
         """
         B = x.shape[0]
+        device = x.device
 
-        # 投影到 d_model 并加位置编码
-        src = self.input_proj(x) + self.src_pos_encoding       # (B, 10, d_model)
+        # ── Encoder: 编码输入序列 ──
+        encoder_out, (h_n, c_n) = self.encoder_lstm(x)  # h_n: (layers, B, hidden)
 
-        # Encoder
-        memory = self.encoder(src)                              # (B, 10, d_model)
+        # 上下文向量：encoder 最终隐状态
+        context = self.context_proj(h_n[-1])  # (B, hidden)
 
-        if self.use_decoder:
-            # 使用可学习的输出查询 + Decoder 交叉注意力
-            tgt = torch.zeros(B, OUTPUT_STEPS, self.d_model, device=x.device)
-            tgt = tgt + self.tgt_pos_encoding
-            output = self.decoder(tgt, memory)                  # (B, 10, d_model)
-        else:
-            # 直接从 encoder 输出回归
-            output = memory
+        # ── 持久预测（基线）──
+        persistence = x[:, -1:, :].repeat(1, OUTPUT_STEPS, 1)  # (B, 10, 24)
 
-        return self.output_head(output)                         # (B, 10, max_dim)
+        # ── 初始 delta ──
+        first_delta = self.init_delta(h_n[-1]).unsqueeze(1)  # (B, 1, 24)
+
+        # Decoder 初始隐状态
+        hidden = (h_n, c_n)
+
+        # ── 自回归生成 ──
+        deltas = []
+        prev_delta = first_delta
+
+        for t in range(OUTPUT_STEPS):
+            # Decoder 输入: concat(prev_delta, context)
+            dec_input = torch.cat([
+                prev_delta,
+                context.unsqueeze(1).expand(-1, prev_delta.shape[1], -1)
+            ], dim=-1)  # (B, 1, input_dim + hidden)
+
+            out, hidden = self.decoder_lstm(dec_input, hidden)
+            delta = self.output_proj(out)  # (B, 1, input_dim)
+            deltas.append(delta)
+
+            # 下一时间步的输入
+            use_tf = self.training and torch.rand(1).item() < teacher_forcing_ratio
+            if use_tf and target is not None:
+                prev_delta = (target[:, t:t+1, :] - persistence[:, t:t+1, :]).detach()
+            else:
+                prev_delta = delta.detach()
+
+        deltas = torch.cat(deltas, dim=1)  # (B, 10, input_dim)
+
+        return persistence + deltas
 
 
 def create_model(device=None):
     """工厂函数：根据配置创建模型并移至指定设备。"""
-    model = TrajectoryTransformer()
+    model = TrajectoryLSTM()
     if device is not None:
         model = model.to(device)
     return model
 
 
 if __name__ == "__main__":
-    # 快速自检
     from config import DEVICE
     model = create_model(DEVICE)
     x = torch.randn(4, 10, 24).to(DEVICE)
-    y = model(x)
+    y_target = torch.randn(4, 10, 24).to(DEVICE)
+    y_train = model(x, y_target, teacher_forcing_ratio=0.5)
+    y_eval = model(x)
     print(f"输入:  {x.shape}")
-    print(f"输出:  {y.shape}")
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"参数量: {total_params:,} (可训练: {trainable_params:,})")
+    print(f"训练模式: {y_train.shape}")
+    print(f"推理模式: {y_eval.shape}")
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"可训练参数量: {total_params:,}")

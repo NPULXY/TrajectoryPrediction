@@ -162,11 +162,15 @@ def plot_loss_curve(log_path=os.path.join(os.path.dirname(__file__), "output", "
     val_losses = []
     with open(log_path, "r", encoding="utf-8") as f:
         for line in f:
-            if "Train Loss:" in line and "Val Loss:" in line:
+            # 兼容新旧日志格式
+            if "Train:" in line and "Val:" in line:
                 parts = line.split("|")
                 try:
-                    tl = float(parts[1].split(":")[1].strip())
-                    vl = float(parts[2].split(":")[1].strip())
+                    # "Train: 0.123" 或 "Train Loss: 0.123"
+                    tl_part = [p for p in parts if "Train" in p][0]
+                    vl_part = [p for p in parts if "Val" in p][0]
+                    tl = float(tl_part.split(":")[1].strip())
+                    vl = float(vl_part.split(":")[1].strip())
                     train_losses.append(tl)
                     val_losses.append(vl)
                 except (IndexError, ValueError):

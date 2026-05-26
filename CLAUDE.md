@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-航天器相对运动轨迹预测项目。使用 Transformer seq2seq 模型，
+航天器相对运动轨迹预测项目。使用 LSTM Encoder-Decoder 模型，
 根据前 10 个时间步的相对运动状态（位置+速度）预测未来 10 步。
 
 ## 运行方式
@@ -14,8 +14,6 @@ python predict.py    # 对新样本推理
 python predict.py --input path/to/input.csv --output path/to/output.csv
 ```
 
-训练前会先从 `output/` 删除旧的 scaler/模型文件（如存在），确保不会错误复用。
-
 ## 项目结构
 
 ```
@@ -23,47 +21,59 @@ python predict.py --input path/to/input.csv --output path/to/output.csv
 ├── train.py               # 训练入口
 ├── evaluate.py            # 评估 + 可视化
 ├── predict.py             # 推理
-├── models/model.py        # TrajectoryTransformer 模型
+├── models/model.py        # TrajectoryLSTM 模型
 ├── utils/data_loader.py   # 数据解析、padding、scaler、DataLoader
-├── Dataset_new2/           # 数据集
+├── Dataset_new2/           # 数据集 (23,787 样本)
 └── output/                 # 模型权重、scaler、图表
 ```
 
-## 关键设计决策
+## 模型架构
 
-### 数据层面
+**TrajectoryLSTM** (Encoder-Decoder + 残差连接):
 
-- **变长目标数处理**：N∈{2,3,4} 的目标数导致特征维度分别为 12/18/24。
-  统一 padding 至 24 维（N=4），同时生成 mask 标记有效维度。
-  损失计算时仅对 mask=True 的维度求 MSE。
-- **CSV 解析**：嵌套列表字符串含逗号，不能用 pandas CSV 解析器（会将一行误判为多列）。
-  改为逐行读取 + `ast.literal_eval`。
-- **标准化**：逐特征维度 z-score（24 个独立均值和标准差），
-  统计量仅从训练集有效数据计算（padding 部分不参与）。
-- **数据划分**：X_now 和 X_next 必须同步打乱，采用相同 random_state 的 sklearn train_test_split。
+```
+输入 (B, 10, 24)
+  → Encoder LSTM (3层, hidden=256)
+  → 上下文向量 + 初始 delta 预测
+  → Decoder LSTM (3层) 自回归生成 10 步 delta
+  → 最终输出 = 持久预测 + delta
+  → 输出 (B, 10, 24)
+```
 
-### 模型架构
+关键设计：
+- **残差连接**：模型预测对未来轨迹的"修正量"（delta），加到持久预测（重复最后一步）上。
+  保证模型至少等于朴素基线，训练初期更快收敛。
+- **Teacher forcing**：训练初期 TF ratio=1.0，在 75 个 epoch 内线性衰减至 0。
+- **LSTM 正交初始化**，forget gate bias=1
 
-- **TrajectoryTransformer**：输入投影 → 可学习位置编码 → Transformer Encoder → Decoder（可选）→ 输出头
-- 默认 `USE_DECODER=True`，Decode r 使用可学习输出查询做交叉注意力。
-  设为 False 时直接从 Encoder 输出回归（参数更少，收敛更快）。
-- GELU 激活、Xavier 初始化、梯度裁剪 max_norm=1.0
+## 训练策略
 
-### 训练策略
+- AdamW + Cosine warmup (5 epochs) + Cosine annealing
+- Peak LR: 1e-3, weight decay: 1e-5
+- Batch size: 128
+- 早停 patience: 50, max epochs: 300
+- 梯度裁剪 max_norm=1.0
 
-- AdamW 优化器 + ReduceLROnPlateau
-- 早停（patience=20），保存在验证集上最优的模型
-- 损失为标准化空间 MSE，评估指标在原始量纲计算
+## 性能
+
+测试集指标（原始量纲）：
+- 整体 RMSE: 1.03
+- 位置 RMSE: 1.46 km (数据范围 0-200 km)
+- 速度 RMSE: 0.0037 km/s = 3.7 m/s (数据范围 0-0.1 km/s)
 
 ## 数据背景
 
 - 物理场景：近地圆轨道 (480 km)，追踪航天器相对非机动目标逼近
 - 坐标系：LVLH（目标在原点）
-- 位置量级 ~0-200 km，速度量级 ~0-0.1 km/s
+- 23,787 样本，N=2/3/4 分布为 46%/31%/23%
 - X_next 包含真实仿真步 (1s 步长) 和可能的 CW 外推步 (60s 步长)
 - 详见 `Dataset_new2/README.md`
 
-## 环境
+## 迭代记录
 
-- Python 3.9+, PyTorch 2.0+, CUDA（可选）
-- 安装：`pip install -r requirements.txt`
+- v1: Transformer Encoder-Decoder → loss 不下降 (0.423)
+- v2: Conv1D + Transformer + Delta 残差 → minor improvement (0.236)
+- v3: Conv1D + Transformer + Cross-attn → 无法学习 (0.407)
+- **v4: LSTM Encoder-Decoder + Delta 残差 + Teacher forcing → 效果良好 (0.017)**
+
+结论：短时序（10步）预测任务中，LSTM 比 Transformer 更有效。
