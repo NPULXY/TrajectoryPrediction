@@ -1,5 +1,6 @@
 """
 训练脚本 —— 训练轨迹预测模型。
+支持原版 LSTM 和物理信息条件 LSTM 两种模式。
 用法: python train.py
 """
 
@@ -14,6 +15,9 @@ from config import (
     DATA_DIR, OUTPUT_DIR, MODEL_SAVE_PATH, SCALER_SAVE_PATH, LOG_PATH,
     DEVICE, BATCH_SIZE, LEARNING_RATE, MIN_LR, WEIGHT_DECAY, EPOCHS,
     EARLY_STOP_PATIENCE, WARMUP_EPOCHS,
+    PHYSICS_ENABLED, PHYSICS_LOSS_WEIGHT, PHYSICS_LOSS_WEIGHT_FINAL,
+    PHYSICS_WARMUP_EPOCHS, MODE_LOSS_WEIGHT, MODE_LOSS_WEIGHT_FINAL,
+    PRED_WARMUP_EPOCHS, DELTAV_LIMIT, CW_N, CW_DT_H, CONDITION_EMBED_DIM,
 )
 from utils.data_loader import (
     load_and_split, create_dataloaders, masked_mse_loss,
@@ -31,36 +35,176 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
     return optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train_epoch(model, loader, optimizer, device, epoch, total_epochs):
+def get_physics_weight(epoch, warmup_epochs, initial, final):
+    """物理损失权重 warmup 调度: 从 initial 线性增长到 final。"""
+    if epoch < PRED_WARMUP_EPOCHS:
+        return 0.0
+    progress = min(1.0, (epoch - PRED_WARMUP_EPOCHS) / max(1, warmup_epochs))
+    return initial + (final - initial) * progress
+
+
+def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
+                physics_loss_fn=None):
     """训练一个 epoch，teacher forcing 比例逐渐降低。"""
     model.train()
     total_loss = 0.0
+    total_l_pred = 0.0
+    total_l_physics = 0.0
+    total_l_mode = 0.0
+
     # Teacher forcing: 前 25% 训练用全 TF，之后线性降至 0
     progress = min(1.0, epoch / (total_epochs * 0.25))
     tf_ratio = max(0.0, 1.0 - progress)
+
+    # 物理损失权重（warmup）
+    lambda_physics = get_physics_weight(
+        epoch, PHYSICS_WARMUP_EPOCHS,
+        PHYSICS_LOSS_WEIGHT, PHYSICS_LOSS_WEIGHT_FINAL
+    )
+    lambda_mode = get_physics_weight(
+        epoch, PHYSICS_WARMUP_EPOCHS,
+        MODE_LOSS_WEIGHT, MODE_LOSS_WEIGHT_FINAL
+    )
+
+    use_physics = PHYSICS_ENABLED and physics_loss_fn is not None and lambda_physics > 0
+
     for x, y, mask in loader:
         x, y, mask = x.to(device), y.to(device), mask.to(device)
         optimizer.zero_grad()
-        pred = model(x, target=y, teacher_forcing_ratio=tf_ratio)
-        loss = masked_mse_loss(pred, y, mask)
+
+        if PHYSICS_ENABLED:
+            pred, dv_all = model(x, target=y, teacher_forcing_ratio=tf_ratio,
+                                 return_dv=True, mask=mask)
+        else:
+            pred = model(x, target=y, teacher_forcing_ratio=tf_ratio)
+            dv_all = None
+
+        # 预测损失
+        l_pred = masked_mse_loss(pred, y, mask)
+        loss = l_pred
+        total_l_pred += l_pred.item()
+
+        # 物理损失
+        if use_physics and dv_all is not None:
+            phys_losses = physics_loss_fn(
+                pred_states=pred,
+                target_states=y,
+                input_states=x,
+                delta_v_pred=dv_all,
+                mask=mask,
+                compute_all=(epoch > PHYSICS_WARMUP_EPOCHS),
+            )
+            l_cw = phys_losses["cw_consistency_input"] + phys_losses["cw_consistency_pred"]
+            l_dv = phys_losses["dv_consistency"]
+            l_bound = phys_losses["dv_bound"]
+
+            l_physics = l_cw + l_bound
+            l_mode = l_dv
+
+            loss = loss + lambda_physics * l_physics + lambda_mode * l_mode
+            total_l_physics += l_physics.item()
+            total_l_mode += l_mode.item()
+
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
         total_loss += loss.item()
-    return total_loss / len(loader), tf_ratio
+
+    n_batches = len(loader)
+    loss_info = {
+        "total": total_loss / n_batches,
+        "pred": total_l_pred / n_batches,
+        "physics": total_l_physics / n_batches,
+        "mode": total_l_mode / n_batches,
+        "tf_ratio": tf_ratio,
+        "lambda_p": lambda_physics,
+        "lambda_m": lambda_mode,
+    }
+    return loss_info
 
 
 @torch.no_grad()
-def validate(model, loader, device):
+def validate(model, loader, device, physics_loss_fn=None):
     """验证，不使用 teacher forcing。"""
     model.eval()
     total_loss = 0.0
+    total_l_pred = 0.0
+    total_l_physics = 0.0
+    total_l_mode = 0.0
+
     for x, y, mask in loader:
         x, y, mask = x.to(device), y.to(device), mask.to(device)
-        pred = model(x)
-        loss = masked_mse_loss(pred, y, mask)
-        total_loss += loss.item()
-    return total_loss / len(loader)
+
+        if PHYSICS_ENABLED:
+            pred, dv_all = model(x, return_dv=True, mask=mask)
+        else:
+            pred = model(x)
+            dv_all = None
+
+        # 预测损失
+        l_pred = masked_mse_loss(pred, y, mask)
+        l_total = l_pred
+        total_l_pred += l_pred.item()
+
+        # 物理损失（验证时始终计算，但不影响早停判断）
+        if PHYSICS_ENABLED and physics_loss_fn is not None and dv_all is not None:
+            phys_losses = physics_loss_fn(
+                pred_states=pred,
+                target_states=y,
+                input_states=x,
+                delta_v_pred=dv_all,
+                mask=mask,
+                compute_all=True,
+            )
+            l_cw = phys_losses["cw_consistency_input"] + phys_losses["cw_consistency_pred"]
+            l_dv = phys_losses["dv_consistency"]
+            total_l_physics += l_cw.item()
+            total_l_mode += l_dv.item()
+
+        total_loss += l_total.item()
+
+    n_batches = len(loader)
+    return {
+        "total": total_loss / n_batches,
+        "pred": total_l_pred / n_batches,
+        "physics": total_l_physics / n_batches,
+        "mode": total_l_mode / n_batches,
+    }
+
+
+def load_pretrained_encoder(model, checkpoint_path, device):
+    """
+    尝试从预训练权重加载 Encoder LSTM 参数。
+    由于新模型的输入维度不同（扩展了条件维度），仅加载兼容的参数。
+    """
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        pretrained_state = checkpoint["model_state_dict"]
+
+        # 筛选可加载的参数
+        model_state = model.state_dict()
+        loaded_keys = []
+        skipped_keys = []
+
+        for key in model_state:
+            if key in pretrained_state:
+                if model_state[key].shape == pretrained_state[key].shape:
+                    model_state[key] = pretrained_state[key]
+                    loaded_keys.append(key)
+                else:
+                    skipped_keys.append(key)
+
+        model.load_state_dict(model_state)
+        print(f"预训练权重加载: {len(loaded_keys)} 层匹配, {len(skipped_keys)} 层形状不兼容")
+        if skipped_keys:
+            print(f"  跳过的层: {skipped_keys}")
+        return True
+    except FileNotFoundError:
+        print(f"预训练权重不存在: {checkpoint_path}，使用随机初始化")
+        return False
+    except Exception as e:
+        print(f"预训练权重加载失败: {e}，使用随机初始化")
+        return False
 
 
 def train():
@@ -85,7 +229,22 @@ def train():
     print(f"\n使用设备: {DEVICE}")
     model = create_model(DEVICE)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"模型类型: {'物理信息条件 LSTM' if PHYSICS_ENABLED else '标准 LSTM'}")
     print(f"可训练参数量: {total_params:,}")
+
+    # ── 尝试加载预训练权重 ──
+    if PHYSICS_ENABLED and os.path.exists(MODEL_SAVE_PATH):
+        load_pretrained_encoder(model, MODEL_SAVE_PATH, DEVICE)
+
+    # ── 物理损失模块 ──
+    physics_loss_fn = None
+    if PHYSICS_ENABLED:
+        from models.physics_loss import PhysicsLoss
+        physics_loss_fn = PhysicsLoss(
+            n=CW_N, dt_h=CW_DT_H, delta_v_limit=DELTAV_LIMIT,
+            device=DEVICE,
+        ).to(DEVICE)
+        print(f"物理损失模块已初始化 (CW n={CW_N:.6f}, dt_h={CW_DT_H}s, Δv_limit={DELTAV_LIMIT}m/s)")
 
     # ── 优化器和调度器 ──
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
@@ -99,9 +258,16 @@ def train():
         log_file.flush()
 
     log(f"训练开始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"模型类型: {'PINN-LSTM' if PHYSICS_ENABLED else '标准LSTM'}")
     log(f"训练样本: {len(train_X)}, 验证样本: {len(val_X)}, 测试样本: {len(test_X)}")
     log(f"Hidden size: {model.hidden_size}, LSTM layers: {model.num_layers}, Batch: {BATCH_SIZE}, Peak LR: {LEARNING_RATE}")
     log(f"Warmup: {WARMUP_EPOCHS} epochs, Weight decay: {WEIGHT_DECAY}")
+    if PHYSICS_ENABLED:
+        log(f"物理损失权重: {PHYSICS_LOSS_WEIGHT} → {PHYSICS_LOSS_WEIGHT_FINAL} (warmup {PHYSICS_WARMUP_EPOCHS} ep)")
+        log(f"模式损失权重: {MODE_LOSS_WEIGHT} → {MODE_LOSS_WEIGHT_FINAL}")
+        embed_dim = getattr(model, 'condition_embed_dim', CONDITION_EMBED_DIM)
+        log(f"Δv 上限: {DELTAV_LIMIT} m/s, 条件嵌入维度: {embed_dim}")
+        log(f"预测预热: 前 {PRED_WARMUP_EPOCHS} epoch 仅使用 L_pred")
     log("-" * 60)
 
     # ── 训练循环 ──
@@ -113,30 +279,57 @@ def train():
     for epoch in pbar:
         t0 = time.time()
 
-        train_loss, tf_ratio = train_epoch(model, train_loader, optimizer, DEVICE, epoch, EPOCHS)
-        val_loss = validate(model, val_loader, DEVICE)
+        train_info = train_epoch(
+            model, train_loader, optimizer, DEVICE, epoch, EPOCHS,
+            physics_loss_fn=physics_loss_fn,
+        )
+        val_info = validate(model, val_loader, DEVICE, physics_loss_fn=physics_loss_fn)
         scheduler.step()
         elapsed = time.time() - t0
 
         current_lr = scheduler.get_last_lr()[0]
-        pbar.set_postfix({"train": f"{train_loss:.6f}", "val": f"{val_loss:.6f}", "tf": f"{tf_ratio:.2f}", "lr": f"{current_lr:.2e}"})
 
-        log(f"Epoch {epoch:3d}/{EPOCHS} | "
-            f"Train: {train_loss:.6f} | "
-            f"Val: {val_loss:.6f} | "
-            f"TF: {tf_ratio:.2f} | "
-            f"LR: {current_lr:.2e} | "
-            f"Time: {elapsed:.1f}s")
+        # 进度条更新
+        pbar.set_postfix({
+            "train": f"{train_info['total']:.6f}",
+            "val": f"{val_info['total']:.6f}",
+            "tf": f"{train_info['tf_ratio']:.2f}",
+            "lr": f"{current_lr:.2e}",
+        })
 
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        # 日志输出
+        if PHYSICS_ENABLED:
+            log(
+                f"Epoch {epoch:3d}/{EPOCHS} | "
+                f"Train: {train_info['total']:.6f} (pred={train_info['pred']:.6f} "
+                f"phy={train_info['physics']:.6f} mode={train_info['mode']:.6f}) | "
+                f"Val: {val_info['total']:.6f} (pred={val_info['pred']:.6f} "
+                f"phy={val_info['physics']:.6f}) | "
+                f"TF: {train_info['tf_ratio']:.2f} | "
+                f"λ_p={train_info['lambda_p']:.3f} λ_m={train_info['lambda_m']:.3f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Time: {elapsed:.1f}s"
+            )
+        else:
+            log(f"Epoch {epoch:3d}/{EPOCHS} | "
+                f"Train: {train_info['total']:.6f} | "
+                f"Val: {val_info['total']:.6f} | "
+                f"TF: {train_info['tf_ratio']:.2f} | "
+                f"LR: {current_lr:.2e} | "
+                f"Time: {elapsed:.1f}s")
+
+        # 早停与模型保存（基于验证预测损失）
+        val_pred_loss = val_info["pred"]
+        if val_pred_loss < best_val_loss:
+            best_val_loss = val_pred_loss
             best_epoch = epoch
             patience_counter = 0
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
-                "val_loss": val_loss,
+                "val_loss": val_pred_loss,
+                "model_type": "pinn_lstm" if PHYSICS_ENABLED else "lstm",
             }, MODEL_SAVE_PATH)
             log(f"  >> 最佳模型已保存")
         else:

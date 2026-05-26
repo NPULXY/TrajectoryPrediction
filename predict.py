@@ -12,7 +12,7 @@ import torch
 
 from config import (
     DATA_DIR, OUTPUT_DIR, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
-    DEVICE, MAX_DIM, INPUT_STEPS, OUTPUT_STEPS,
+    DEVICE, MAX_DIM, INPUT_STEPS, OUTPUT_STEPS, PHYSICS_ENABLED,
 )
 from utils.data_loader import FeatureScaler, parse_csv
 from models.model import create_model
@@ -42,7 +42,8 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH, scaler_path=SCA
     checkpoint = torch.load(model_path, map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
-    print(f"模型已加载: {model_path} (epoch {checkpoint['epoch']}, val_loss={checkpoint['val_loss']:.6f})")
+    model_type = checkpoint.get("model_type", "lstm")
+    print(f"模型已加载: {model_path} (epoch {checkpoint['epoch']}, val_loss={checkpoint['val_loss']:.6f}, type={model_type})")
 
     # ── 读取并解析输入数据 ──
     samples, masks = parse_csv(input_path)
@@ -60,7 +61,12 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH, scaler_path=SCA
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
             batch = X_tensor[i:i + batch_size]
-            pred = model(batch)             # (B, 10, 24)
+
+            if PHYSICS_ENABLED:
+                pred, _ = model(batch, return_dv=True)
+            else:
+                pred = model(batch)
+
             all_preds.append(pred.cpu().numpy())
 
     preds_norm = np.concatenate(all_preds, axis=0)   # (N, 10, 24)

@@ -147,8 +147,23 @@ class TrajectoryLSTM(nn.Module):
 
 
 def create_model(device=None):
-    """工厂函数：根据配置创建模型并移至指定设备。"""
-    model = TrajectoryLSTM()
+    """工厂函数：根据配置创建模型并移至指定设备。
+
+    当 PHYSICS_ENABLED=True 时返回物理信息条件 LSTM，
+    否则返回标准 TrajectoryLSTM（向后兼容）。
+    """
+    try:
+        from config import PHYSICS_ENABLED, CONDITION_EMBED_DIM
+    except ImportError:
+        PHYSICS_ENABLED = False
+        CONDITION_EMBED_DIM = 8
+
+    if PHYSICS_ENABLED:
+        from models.pinn_lstm import PhysicsInformedTrajectoryLSTM
+        model = PhysicsInformedTrajectoryLSTM(condition_embed_dim=CONDITION_EMBED_DIM)
+    else:
+        model = TrajectoryLSTM()
+
     if device is not None:
         model = model.to(device)
     return model

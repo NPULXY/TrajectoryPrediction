@@ -30,6 +30,20 @@ NUM_ENCODER_LAYERS = 4          # Encoder 层数（仅 Transformer 使用）
 DIM_FEEDFORWARD = 512           # 前馈网络维度（仅 Transformer 使用）
 DROPOUT = 0.15                  # Dropout 概率
 
+# ==================== 物理信息配置 ====================
+PHYSICS_ENABLED = True          # 是否启用物理信息条件 LSTM（False 则使用原版）
+CONDITION_EMBED_DIM = 8         # 条件嵌入维度（模式嵌入 + 机动特征）
+PHYSICS_LOSS_WEIGHT = 0.1       # λ₁: 物理损失初始权重
+PHYSICS_LOSS_WEIGHT_FINAL = 0.5 # λ₁: 物理损失最终权重（warmup 后）
+PHYSICS_WARMUP_EPOCHS = 20      # 物理损失权重 warmup 轮数
+MODE_LOSS_WEIGHT = 0.01         # λ₂: 模式/Δv 一致性损失权重
+MODE_LOSS_WEIGHT_FINAL = 0.05   # λ₂: 模式损失最终权重
+DELTAV_LIMIT = 3.0              # Δv 幅值上限 (m/s)
+CW_N = 0.001134                 # 轨道平均角速度 (rad/s)
+CW_DT_H = 1.0                   # CW 递推短步长 (s)
+CW_DT_T = 60.0                  # CW 递推长步长 (s)
+PRED_WARMUP_EPOCHS = 5          # 预测损失预热轮数（仅用 L_pred）
+
 # ==================== 训练配置 ====================
 BATCH_SIZE = 128                # 批大小
 LEARNING_RATE = 1e-3            # 峰值学习率
