@@ -84,26 +84,24 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
         loss = l_pred
         total_l_pred += l_pred.item()
 
-        # 物理损失
+        # 物理损失（在原始量纲空间计算，通过 scaler 反标准化）
         if use_physics and dv_all is not None:
             phys_losses = physics_loss_fn(
                 pred_states=pred,
                 target_states=y,
                 input_states=x,
-                delta_v_pred=dv_all,
                 mask=mask,
                 compute_all=(epoch > PHYSICS_WARMUP_EPOCHS),
             )
-            l_cw = phys_losses["cw_consistency_input"] + phys_losses["cw_consistency_pred"]
-            l_dv = phys_losses["dv_consistency"]
-            l_bound = phys_losses["dv_bound"]
+            l_cw = phys_losses["cw_input"] + phys_losses["cw_pred"]
+            l_dv = phys_losses["dv_change"]
 
-            l_physics = l_cw + l_bound
-            l_mode = l_dv
+            l_physics = l_cw
+            l_bound = l_dv
 
-            loss = loss + lambda_physics * l_physics + lambda_mode * l_mode
+            loss = loss + lambda_physics * l_physics + lambda_mode * l_bound
             total_l_physics += l_physics.item()
-            total_l_mode += l_mode.item()
+            total_l_mode += l_bound.item()
 
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -152,14 +150,11 @@ def validate(model, loader, device, physics_loss_fn=None):
                 pred_states=pred,
                 target_states=y,
                 input_states=x,
-                delta_v_pred=dv_all,
                 mask=mask,
                 compute_all=True,
             )
-            l_cw = phys_losses["cw_consistency_input"] + phys_losses["cw_consistency_pred"]
-            l_dv = phys_losses["dv_consistency"]
-            total_l_physics += l_cw.item()
-            total_l_mode += l_dv.item()
+            total_l_physics += (phys_losses["cw_input"].item() + phys_losses["cw_pred"].item())
+            total_l_mode += phys_losses["dv_change"].item()
 
         total_loss += l_total.item()
 
@@ -236,13 +231,13 @@ def train():
     if PHYSICS_ENABLED and os.path.exists(MODEL_SAVE_PATH):
         load_pretrained_encoder(model, MODEL_SAVE_PATH, DEVICE)
 
-    # ── 物理损失模块 ──
+    # ── 物理损失模块（传入 scaler 以在物理空间计算损失）──
     physics_loss_fn = None
     if PHYSICS_ENABLED:
         from models.physics_loss import PhysicsLoss
         physics_loss_fn = PhysicsLoss(
-            n=CW_N, dt_h=CW_DT_H, delta_v_limit=DELTAV_LIMIT,
-            device=DEVICE,
+            scaler=scaler, n=CW_N, dt_h=CW_DT_H,
+            delta_v_limit=DELTAV_LIMIT, device=DEVICE,
         ).to(DEVICE)
         print(f"物理损失模块已初始化 (CW n={CW_N:.6f}, dt_h={CW_DT_H}s, Δv_limit={DELTAV_LIMIT}m/s)")
 

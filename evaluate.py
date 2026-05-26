@@ -31,26 +31,24 @@ matplotlib.rcParams["axes.unicode_minus"] = False
 
 def compute_cw_metrics(preds_raw, masks, dv_all=None):
     """
-    计算物理一致性指标: CW 单步递推残差。
+    计算物理一致性指标: CW 单步递推残差和速度变化统计。
 
     Args:
         preds_raw: (N, 10, 24) 预测轨迹（原始量纲）
         masks:     (N, 24) 有效特征掩码
-        dv_all:    (N, 19, max_N*3) Δv 估计（可选）
+        dv_all:    (N, 19, max_N*3) Δv 估计（可选，仅用于记录）
 
     Returns:
-        dict: CW 残差统计量
+        dict: CW 残差和速度变化统计量
     """
-    from models.physics_loss import compute_cw_matrix, compute_cw_B_eff, N_MEAN
+    from models.physics_loss import compute_cw_matrix, N_MEAN
 
     Phi_h = compute_cw_matrix(N_MEAN, CW_DT_H)
-    B_eff = compute_cw_B_eff(Phi_h)
+    Phi_np = Phi_h.numpy()
 
     n_total = preds_raw.shape[0]
-    max_N = MAX_DIM // 6
-
     cw_residuals = []
-    dv_magnitudes = []
+    dv_magnitudes = []  # 速度变化幅值
 
     for i in range(n_total):
         mask = masks[i]
@@ -61,23 +59,20 @@ def compute_cw_metrics(preds_raw, masks, dv_all=None):
         for a in range(n_agents):
             base = a * 6
             states = preds_raw[i, :, base:base + 6]  # (10, 6)
+
             # CW 自由演化残差
             for t in range(9):
                 s_curr = states[t]
                 s_next = states[t + 1]
-                s_free = Phi_h @ s_curr.numpy() if isinstance(s_curr, torch.Tensor) else Phi_h.numpy() @ s_curr
-                if isinstance(s_curr, torch.Tensor):
-                    s_free = torch.from_numpy(s_free).float()
-                residual = s_next.numpy() - s_free if isinstance(s_next, torch.Tensor) else s_next - s_free
-                cw_residuals.append(np.linalg.norm(residual))
+                s_free = Phi_np @ s_curr
+                residual = s_next - s_free
+                cw_residuals.append(float(np.linalg.norm(residual)))
 
-        # Δv 幅值统计
-        if dv_all is not None and i < dv_all.shape[0]:
-            dv = dv_all[i]  # (19, max_N*3)
-            for a in range(n_agents):
-                dv_agent = dv[:, a * 3:(a + 1) * 3]  # (19, 3)
-                mags = np.linalg.norm(dv_agent, axis=-1)  # (19,)
-                dv_magnitudes.extend(mags.tolist())
+            # 速度变化（Δv 近似）
+            vel = states[:, 3:6]  # (10, 3)
+            dv = vel[1:] - vel[:-1]  # (9, 3)
+            mags = np.linalg.norm(dv, axis=-1)  # (9,)
+            dv_magnitudes.extend(mags.tolist())
 
     result = {
         "cw_residual_mean": float(np.mean(cw_residuals)) if cw_residuals else 0.0,
