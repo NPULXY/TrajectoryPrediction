@@ -71,18 +71,25 @@ class FeatureScaler:
 def parse_csv(filepath):
     """
     读取 CSV 文件并解析嵌套列表字符串。
+    注意：由于嵌套列表中包含逗号，不能直接使用 pandas 的 CSV 解析器，
+    需逐行读取文件并跳过表头。
 
     Returns:
         samples: list of numpy arrays, 每个形状 (10, N*6)
         masks:   list of numpy arrays, 每个形状 (max_dim,) bool
     """
-    df = pd.read_csv(filepath)
-    col_name = df.columns[0]
     samples = []
     masks = []
 
-    for val in df[col_name]:
-        nested = ast.literal_eval(val)               # list of 10 lists
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    # 第一行为表头（如 "X_now" 或 "X_next"），跳过
+    for line in lines[1:]:
+        line = line.strip()
+        if not line:
+            continue
+        nested = ast.literal_eval(line)              # list of 10 lists
         arr = np.array(nested, dtype=np.float32)     # (10, N*6)
         n_features = arr.shape[1]
 
@@ -127,9 +134,13 @@ def load_and_split(data_dir=DATA_DIR, seed=RANDOM_SEED):
     print(f"数据形状: X={X.shape}, Y={Y.shape}, masks={masks.shape}")
 
     # 按 N 统计样本数
-    for n in range(1, MAX_N + 1):
-        count = (masks[:, n * 6 - 1]).sum()  # 该 N 的最后一位是否为 True
-        print(f"  N={n}: {count} 个样本 ({count / len(X) * 100:.1f}%)")
+    # N=2: 有第12个特征但无第13个; N=3: 有第18个但无第19个; N=4: 有第24个
+    n2 = int((masks[:, 11] & ~masks[:, 12]).sum())
+    n3 = int((masks[:, 17] & ~masks[:, 18]).sum())
+    n4 = int(masks[:, 23].sum())
+    print(f"  N=2: {n2} 个样本 ({n2 / len(X) * 100:.1f}%)")
+    print(f"  N=3: {n3} 个样本 ({n3 / len(X) * 100:.1f}%)")
+    print(f"  N=4: {n4} 个样本 ({n4 / len(X) * 100:.1f}%)")
 
     # 同步打乱索引
     np.random.seed(seed)
