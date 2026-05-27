@@ -92,7 +92,7 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
                 input_states=x,
                 mask=mask,
                 compute_all=(epoch > PHYSICS_WARMUP_EPOCHS),
-            )
+            ) # type: ignore
             l_cw = phys_losses["cw_input"] + phys_losses["cw_pred"]
             l_dv = phys_losses["dv_change"]
 
@@ -104,7 +104,7 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
             total_l_mode += l_bound.item()
 
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # type: ignore
         optimizer.step()
         total_loss += loss.item()
 

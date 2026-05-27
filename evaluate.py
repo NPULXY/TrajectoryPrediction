@@ -187,12 +187,12 @@ def plot_predictions(preds, targets, masks, scaler, num_samples=5, save_dir=OUTP
             ax3d.plot(pred[:, base + 0], pred[:, base + 1], pred[:, base + 2],
                       "r--", linewidth=2, label="预测")
             ax3d.scatter(true[0, base + 0], true[0, base + 1], true[0, base + 2],
-                         c="blue", s=50, marker="o")
+                         c="blue", s=50, marker="o") # type: ignore
             ax3d.scatter(pred[0, base + 0], pred[0, base + 1], pred[0, base + 2],
-                         c="red", s=50, marker="o")
+                         c="red", s=50, marker="o") # type: ignore
             ax3d.set_xlabel("X (km)")
             ax3d.set_ylabel("Y (km)")
-            ax3d.set_zlabel("Z (km)")
+            ax3d.set_zlabel("Z (km)") # type: ignore
             ax3d.set_title(f"目标 {agent+1} 3D 轨迹")
             ax3d.legend(fontsize=7)
 
@@ -315,16 +315,16 @@ def plot_loss_curve(log_path=os.path.join(os.path.dirname(__file__), "output", "
     ax1.grid(True, alpha=0.3)
 
     if train_pred:
-        ax2.plot(epochs[:len(train_pred)], train_pred, "b-", linewidth=1, label="训练预测损失")
-        ax2.plot(epochs[:len(train_phy)], train_phy, "g-", linewidth=1, label="训练物理损失")
-        ax2.plot(epochs[:len(train_mode)], train_mode, "m-", linewidth=1, label="训练模式损失")
+        ax2.plot(epochs[:len(train_pred)], train_pred, "b-", linewidth=1, label="训练预测损失") # type: ignore
+        ax2.plot(epochs[:len(train_phy)], train_phy, "g-", linewidth=1, label="训练物理损失") # type: ignore
+        ax2.plot(epochs[:len(train_mode)], train_mode, "m-", linewidth=1, label="训练模式损失") # type: ignore
         if val_pred:
-            ax2.plot(epochs[:len(val_pred)], val_pred, "r--", linewidth=1, label="验证预测损失")
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("Loss")
-        ax2.set_title("损失各分量")
-        ax2.legend(fontsize=7)
-        ax2.grid(True, alpha=0.3)
+            ax2.plot(epochs[:len(val_pred)], val_pred, "r--", linewidth=1, label="验证预测损失") # type: ignore
+        ax2.set_xlabel("Epoch") # type: ignore
+        ax2.set_ylabel("Loss") # type: ignore
+        ax2.set_title("损失各分量") # type: ignore
+        ax2.legend(fontsize=7) # type: ignore
+        ax2.grid(True, alpha=0.3) # type: ignore
 
     plt.tight_layout()
     save_path = os.path.join(save_dir, "loss_curve.png")
