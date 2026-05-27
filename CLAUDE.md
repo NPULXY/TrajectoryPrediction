@@ -17,6 +17,7 @@ python train.py      # 训练模型
 python evaluate.py   # 评估并生成可视化图表
 python predict.py    # 对新样本推理
 python predict.py --input path/to/input.csv --output path/to/output.csv
+python predict.py --visualize --top-k 10  # 推理 + 可视化最佳预测样本
 ```
 
 ## 项目结构
@@ -25,14 +26,14 @@ python predict.py --input path/to/input.csv --output path/to/output.csv
 ├── config.py                  # 所有超参数和路径
 ├── train.py                   # 训练入口（支持双模式）
 ├── evaluate.py                # 评估 + 可视化（含物理一致性指标）
-├── predict.py                 # 推理
+├── predict.py                 # 推理 + 最佳预测可视化（--visualize）
 ├── models/
 │   ├── model.py               # 标准 TrajectoryLSTM + create_model 工厂
 │   ├── pinn_lstm.py           # 物理信息条件 LSTM (v5, 新增)
 │   └── physics_loss.py        # CW 残差、Δv 一致性等物理损失 (新增)
 ├── utils/data_loader.py       # 数据解析、padding、scaler、DataLoader
 ├── Dataset_new2/              # 数据集 (23,787 样本)
-└── output/                    # 模型权重、scaler、图表
+└── output/                    # 模型权重、scaler、图表、最佳预测可视化 (best_predictions/)
 ```
 
 ## 模型架构 (v5: 物理信息条件 LSTM)
