@@ -18,6 +18,7 @@ from config import (
     PHYSICS_ENABLED, PHYSICS_LOSS_WEIGHT, PHYSICS_LOSS_WEIGHT_FINAL,
     PHYSICS_WARMUP_EPOCHS, MODE_LOSS_WEIGHT, MODE_LOSS_WEIGHT_FINAL,
     PRED_WARMUP_EPOCHS, DELTAV_LIMIT, CW_N, CW_DT_H, CONDITION_EMBED_DIM,
+    RESUME_TRAINING,
 )
 from utils.data_loader import (
     load_and_split, create_dataloaders, masked_mse_loss,
@@ -227,10 +228,6 @@ def train():
     print(f"模型类型: {'物理信息条件 LSTM' if PHYSICS_ENABLED else '标准 LSTM'}")
     print(f"可训练参数量: {total_params:,}")
 
-    # ── 尝试加载预训练权重 ──
-    if PHYSICS_ENABLED and os.path.exists(MODEL_SAVE_PATH):
-        load_pretrained_encoder(model, MODEL_SAVE_PATH, DEVICE)
-
     # ── 物理损失模块（传入 scaler 以在物理空间计算损失）──
     physics_loss_fn = None
     if PHYSICS_ENABLED:
@@ -245,14 +242,35 @@ def train():
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = get_cosine_schedule_with_warmup(optimizer, WARMUP_EPOCHS, EPOCHS)
 
+    # ── 从检查点恢复 ──
+    start_epoch = 1
+    best_val_loss = float("inf")
+    best_epoch = 0
+    patience_counter = 0
+
+    if RESUME_TRAINING and os.path.exists(MODEL_SAVE_PATH):
+        checkpoint = torch.load(MODEL_SAVE_PATH, map_location=DEVICE)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        start_epoch = checkpoint["epoch"] + 1
+        best_val_loss = checkpoint["val_loss"]
+        best_epoch = checkpoint["epoch"]
+        # 恢复学习率调度器状态
+        for _ in range(checkpoint["epoch"]):
+            scheduler.step()
+        print(f"从检查点恢复: epoch {checkpoint['epoch']}, val_loss={best_val_loss:.6f}, "
+              f"当前 LR={scheduler.get_last_lr()[0]:.2e}")
+    elif PHYSICS_ENABLED and os.path.exists(MODEL_SAVE_PATH):
+        load_pretrained_encoder(model, MODEL_SAVE_PATH, DEVICE)
+
     # ── 日志 ──
-    log_file = open(LOG_PATH, "w", encoding="utf-8")
+    log_file = open(LOG_PATH, "a", encoding="utf-8") if (RESUME_TRAINING and start_epoch > 1) else open(LOG_PATH, "w", encoding="utf-8")
     def log(msg):
         print(msg)
         log_file.write(msg + "\n")
         log_file.flush()
 
-    log(f"训练开始: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"\n训练开始/恢复: {time.strftime('%Y-%m-%d %H:%M:%S')}")
     log(f"模型类型: {'PINN-LSTM' if PHYSICS_ENABLED else '标准LSTM'}")
     log(f"训练样本: {len(train_X)}, 验证样本: {len(val_X)}, 测试样本: {len(test_X)}")
     log(f"Hidden size: {model.hidden_size}, LSTM layers: {model.num_layers}, Batch: {BATCH_SIZE}, Peak LR: {LEARNING_RATE}")
@@ -263,13 +281,11 @@ def train():
         embed_dim = getattr(model, 'condition_embed_dim', CONDITION_EMBED_DIM)
         log(f"Δv 上限: {DELTAV_LIMIT} m/s, 条件嵌入维度: {embed_dim}")
         log(f"预测预热: 前 {PRED_WARMUP_EPOCHS} epoch 仅使用 L_pred")
+    log(f"恢复模式: start_epoch={start_epoch}, best_epoch={best_epoch}, best_val_loss={best_val_loss:.6f}")
     log("-" * 60)
 
     # ── 训练循环 ──
-    best_val_loss = float("inf")
-    best_epoch = 0
-    patience_counter = 0
-    pbar = tqdm(range(1, EPOCHS + 1), desc="训练", unit="epoch")
+    pbar = tqdm(range(start_epoch, EPOCHS + 1), desc="训练", unit="epoch")
 
     for epoch in pbar:
         t0 = time.time()

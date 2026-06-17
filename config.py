@@ -6,7 +6,7 @@ import torch
 import os
 
 # ==================== 路径配置 ====================
-DATA_DIR = os.path.join(os.path.dirname(__file__), "Dataset_new2")
+DATA_DIR = os.path.join(os.path.dirname(__file__), "Dataset_Summary")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, "best_model.pth")
 SCALER_SAVE_PATH = os.path.join(OUTPUT_DIR, "scaler.pkl")
@@ -49,9 +49,10 @@ BATCH_SIZE = 128                # 批大小
 LEARNING_RATE = 1e-3            # 峰值学习率
 MIN_LR = 1e-6                   # 最小学习率
 WEIGHT_DECAY = 1e-5             # 权重衰减
-EPOCHS = 300                    # 最大训练轮数
+EPOCHS = 100                    # 最大训练轮数
 EARLY_STOP_PATIENCE = 50        # 早停耐心值
 WARMUP_EPOCHS = 5               # 学习率 warmup 轮数
+RESUME_TRAINING = True          # 是否从最佳检查点恢复训练
 
 # ==================== 特征索引（用于分项评估） ====================
 def _make_pos_vel_indices():

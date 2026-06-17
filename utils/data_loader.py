@@ -2,7 +2,7 @@
 数据加载模块：解析 CSV、padding、z-score 标准化、数据集划分。
 """
 
-import ast
+import json
 import pickle
 import numpy as np
 import pandas as pd
@@ -89,7 +89,7 @@ def parse_csv(filepath):
         line = line.strip()
         if not line:
             continue
-        nested = ast.literal_eval(line)              # list of 10 lists
+        nested = json.loads(line)                    # list of 10 lists
         arr = np.array(nested, dtype=np.float32)     # (10, N*6)
         n_features = arr.shape[1]
 

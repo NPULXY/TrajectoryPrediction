@@ -23,8 +23,10 @@ from config import (
 from utils.data_loader import FeatureScaler, parse_csv
 from models.model import create_model
 
-# ── 中文字体配置 ──
-plt.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
+# ── 字体配置：Times New Roman，变量斜体 ──
+plt.rcParams["font.family"] = "serif"
+plt.rcParams["font.serif"] = ["Times New Roman", "DejaVu Serif"]
+plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["axes.unicode_minus"] = False
 
 # ── 目标颜色映射 ──
@@ -32,9 +34,9 @@ TARGET_COLORS = ["#1f77b4", "#2ca02c", "#d62728", "#ff7f0e"]  # 深蓝 深绿 �
 
 
 def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
-                               mse_array, top_indices, output_dir):
+                               dist_array, top_indices, output_dir):
     """
-    为 MSE 最小的 top-k 样本生成综合轨迹图。
+    为末端距离最小的 top-k 样本生成综合轨迹图。
 
     每张图包含：
       - 左侧：所有目标的 3D 组合轨迹图
@@ -45,17 +47,17 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
         preds_raw:   (N, 10, 24) 预测未来轨迹（原始量纲）
         gt_raw:      (N, 10, 24) 真实未来轨迹（原始量纲）
         masks:       (N, 24) 各样本有效特征 bool mask
-        mse_array:   (N,) 各样本的 MSE
+        dist_array:  (N,) 各样本的平均末端距离 (km)
         top_indices: (k,) 最佳样本索引（已排序）
         output_dir:  图片保存目录
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    time_known = np.arange(1, INPUT_STEPS + 1)                          # 1-10
-    time_future = np.arange(INPUT_STEPS + 1, INPUT_STEPS + OUTPUT_STEPS + 1)  # 11-20
+    time_known = np.arange(1, INPUT_STEPS + 1) * 60                       # 60, 120, ..., 600 s
+    time_future = np.arange(INPUT_STEPS + 1, INPUT_STEPS + OUTPUT_STEPS + 1) * 60  # 660, ..., 1200 s
 
     for rank, sample_idx in enumerate(top_indices, 1):
-        mse_val = mse_array[sample_idx]
+        dist_val = dist_array[sample_idx]
         mask = masks[sample_idx]
         n_features = int(mask.sum())
         n_targets = n_features // 6
@@ -88,26 +90,18 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
             ax_3d.plot(xt, yt, zt, color=color, linestyle="-", linewidth=2.0)
             ax_3d.plot(xp, yp, zp, color=color, linestyle="--", linewidth=1.5)
 
-            # 起点/终点标记
-            ax_3d.scatter([xk[0]], [yk[0]], [zk[0]],
-                          color=color, marker="o", s=40, zorder=5)
-            ax_3d.scatter([xt[-1]], [yt[-1]], [zt[-1]],
-                          color=color, marker="^", s=50, zorder=5)
-            ax_3d.scatter([xp[-1]], [yp[-1]], [zp[-1]],
-                          color=color, marker="s", s=50, zorder=5)
-
-        # 3D 图例（统一灰线说明线型）
+        # 3D legend
         ax_3d.plot([], [], [], color="gray", linestyle="-", alpha=0.4,
-                   linewidth=1.2, label="已知轨迹")
+                   linewidth=1.2, label="Known")
         ax_3d.plot([], [], [], color="gray", linestyle="-", linewidth=2.0,
-                   label="真实未来")
+                   label="True")
         ax_3d.plot([], [], [], color="gray", linestyle="--", linewidth=1.5,
-                   label="预测未来")
+                   label="Predicted")
         ax_3d.legend(loc="best", fontsize=8)
-        ax_3d.set_xlabel("x (km)")
-        ax_3d.set_ylabel("y (km)")
-        ax_3d.set_zlabel("z (km)")
-        ax_3d.set_title("3D 组合轨迹", fontsize=10)
+        ax_3d.set_xlabel("$x$ (km)")
+        ax_3d.set_ylabel("$y$ (km)")
+        ax_3d.set_zlabel("$z$ (km)") # type: ignore
+        ax_3d.set_title("3D Trajectories", fontsize=10)
 
         # ── 右侧：位置分量子图 ──
         for t in range(n_targets):
@@ -124,40 +118,58 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
                 ax.plot(time_future, preds_raw[sample_idx, :, base + offset],
                         color=color, linestyle="--", linewidth=1.2)
 
-                # 分界线：已知 / 未来
-                ax.axvline(x=INPUT_STEPS + 0.5, color="gray", linestyle=":",
+                # Divider between known and future
+                ax.axvline(x=630, color="gray", linestyle=":",
                            alpha=0.5, linewidth=0.8)
 
-                ax.set_ylabel(f"{axis_label} (km)", fontsize=8)
+                ax.set_ylabel(f"${axis_label}$ (km)", fontsize=8)
                 if t == n_targets - 1:
-                    ax.set_xlabel("时间步", fontsize=8)
+                    ax.set_xlabel("$t$ (s)", fontsize=8)
                 if t == 0:
-                    ax.set_title(f"{axis_label} 分量", fontsize=9)
+                    ax.set_title(f"${axis_label}$", fontsize=9)
                 ax.tick_params(labelsize=7)
                 ax.grid(True, alpha=0.25)
 
         # ── 总标题 ──
-        fig.suptitle(f"Top-{rank} | Overall MSE: {mse_val:.6f} | N={n_targets}",
+        fig.suptitle(f"Top-{rank} | Terminal distance: {dist_val:.4f} km | $N$ = {n_targets}",
                      fontsize=13, fontweight="bold", y=0.99)
 
         # ── 保存 ──
-        save_name = f"top{rank:02d}_mse{mse_val:.6f}_N{n_targets}.png"
+        save_name = f"top{rank:02d}_dist{dist_val:.4f}_N{n_targets}.png"
         save_path = os.path.join(output_dir, save_name)
         fig.savefig(save_path, dpi=150, bbox_inches="tight")
         plt.close(fig)
         print(f"  [{rank}/{len(top_indices)}] 已保存: {save_name}")
 
 
-def compute_masked_mse(pred_norm, gt_norm, masks):
-    """计算每个样本的 masked MSE（仅有效特征维度）。"""
-    n_samples = pred_norm.shape[0]
-    mse_list = []
+def compute_terminal_distance(pred_raw, gt_raw, masks):
+    """计算每个样本预测末端与真实末端的平均 3D 距离（仅有效目标，单位 km）。
+
+    Args:
+        pred_raw: (N, 10, 24) 预测轨迹（原始量纲）
+        gt_raw:   (N, 10, 24) 真实轨迹（原始量纲）
+        masks:    (N, 24) 有效特征 bool mask
+
+    Returns:
+        (N,) 各样本的平均末端距离
+    """
+    n_samples = pred_raw.shape[0]
+    dist_list = []
     for i in range(n_samples):
-        n_valid = int(masks[i].sum())
-        p = pred_norm[i, :, :n_valid]
-        g = gt_norm[i, :, :n_valid]
-        mse_list.append(float(np.mean((p - g) ** 2)))
-    return np.array(mse_list)
+        n_targets = int(masks[i].sum()) // 6
+        # 末步位置索引
+        last_step = -1
+        max_dist = 0.0
+        for tgt in range(n_targets):
+            base = tgt * 6
+            dx = pred_raw[i, last_step, base + 0] - gt_raw[i, last_step, base + 0]
+            dy = pred_raw[i, last_step, base + 1] - gt_raw[i, last_step, base + 1]
+            dz = pred_raw[i, last_step, base + 2] - gt_raw[i, last_step, base + 2]
+            dist = np.sqrt(dx*dx + dy*dy + dz*dz)
+            if dist > max_dist:
+                max_dist = dist
+        dist_list.append(max_dist)
+    return np.array(dist_list)
 
 
 def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
@@ -257,18 +269,31 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
             return
 
         gt_raw = np.stack(gt_samples, axis=0)           # (N, 10, 24)
-        gt_norm = scaler.transform(gt_raw)
 
-        # 计算各样本 MSE（标准化空间）
-        mse_array = compute_masked_mse(preds_norm, gt_norm, masks_np)
+        # 计算各样本预测末端与真实末端的平均 3D 距离
+        dist_array = compute_terminal_distance(preds_raw, gt_raw, masks_np)
 
-        # 排序取 top-k
-        effective_k = min(top_k, n_samples)
-        top_indices = np.argsort(mse_array)[:effective_k]
-
-        print(f"MSE 范围: [{mse_array.min():.6f}, {mse_array.max():.6f}], "
-              f"均值: {mse_array.mean():.6f}")
-        print(f"最佳 {effective_k} 个样本 MSE: {mse_array[top_indices]}")
+        # 按 N（目标数）分组，每组各取 top-k/3 个最佳样本
+        n_targets_per_sample = masks_np.sum(axis=1) // 6  # (N,)
+        top_indices_list = []
+        for n_val in [2, 3, 4]:
+            group_mask = n_targets_per_sample == n_val
+            group_indices = np.where(group_mask)[0]
+            if len(group_indices) == 0:
+                continue
+            n_select = min(top_k // 3 if top_k >= 3 else max(1, top_k), len(group_indices))
+            # 每组内按末端距离升序取前 n_select 个（距离越小越好）
+            group_order = np.argsort(dist_array[group_indices])[:n_select]
+            selected = group_indices[group_order]
+            top_indices_list.append(selected)
+            print(f"  N={n_val}: {len(group_indices)} 个样本, "
+                  f"末端距离范围 [{dist_array[group_indices].min():.4f}, "
+                  f"{dist_array[group_indices].max():.4f}] km, "
+                  f"选取 {n_select} 个: {dist_array[selected]}")
+        top_indices = np.concatenate(top_indices_list)
+        # 最终按末端距离升序统一排序
+        final_order = np.argsort(dist_array[top_indices])
+        top_indices = top_indices[final_order]
 
         vis_dir = os.path.join(OUTPUT_DIR, "best_predictions")
         # 清空已有目录
@@ -279,9 +304,9 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
         print(f"\n生成最佳预测可视化图，保存至: {vis_dir}")
         visualize_best_predictions(
             X_raw, preds_raw, gt_raw, masks_np,
-            mse_array, top_indices, vis_dir,
+            dist_array, top_indices, vis_dir,
         )
-        print(f"可视化完成，共 {effective_k} 张图。")
+        print(f"可视化完成，共 {len(top_indices)} 张图。")
 
 
 def main():
@@ -294,12 +319,14 @@ def main():
                         help="模型权重路径")
     parser.add_argument("--scaler", type=str, default=SCALER_SAVE_PATH,
                         help="Scaler 路径")
-    parser.add_argument("--visualize", action="store_true", default=False,
-                        help="启用最佳预测样本可视化")
+    parser.add_argument("--visualize", action="store_true", default=True,
+                        help="启用最佳预测样本可视化（默认开启）")
+    parser.add_argument("--no-visualize", action="store_false", dest="visualize",
+                        help="禁用可视化")
     parser.add_argument("--ground-truth", type=str, default=None,
                         help="真实未来轨迹 CSV 路径（默认 Dataset_new2/X_next.csv）")
-    parser.add_argument("--top-k", type=int, default=10,
-                        help="可视化最佳样本数量（默认 10）")
+    parser.add_argument("--top-k", type=int, default=30,
+                        help="可视化最佳样本数量（默认 30，N=2/3/4 各 10 个）")
     args = parser.parse_args()
 
     # 默认输入输出路径
