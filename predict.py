@@ -5,12 +5,25 @@
 """
 
 import os
+import sys
+
+# ── conda MKL DLL 搜索路径修复 (Windows) ──
+if sys.platform == "win32":
+    _conda_lib_bin_candidates = [
+        os.environ.get("CONDA_PREFIX", ""),
+        sys.prefix,
+    ]
+    for _prefix in _conda_lib_bin_candidates:
+        _lib_bin = os.path.join(_prefix, "Library", "bin") if _prefix else ""
+        if _lib_bin and os.path.isdir(_lib_bin) and _lib_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _lib_bin + os.pathsep + os.environ.get("PATH", "")
+
 import ast
 import argparse
-import shutil
 import numpy as np
 import pandas as pd
 import torch
+import scipy.io as sio
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -28,6 +41,15 @@ plt.rcParams["font.family"] = "serif"
 plt.rcParams["font.serif"] = ["Times New Roman", "DejaVu Serif"]
 plt.rcParams["mathtext.fontset"] = "stix"
 plt.rcParams["axes.unicode_minus"] = False
+plt.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 20,
+    "axes.labelsize": 20,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 20,
+    "figure.titlesize": 20,
+})
 
 # ── 目标颜色映射 ──
 TARGET_COLORS = ["#1f77b4", "#2ca02c", "#d62728", "#ff7f0e"]  # 深蓝 深绿 深红 深橙
@@ -63,11 +85,12 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
         n_targets = n_features // 6
 
         # ── 创建图形 ──
-        fig_height = max(8, 3.0 * n_targets)
-        fig = plt.figure(figsize=(16, fig_height))
+        fig_height = max(12, 5.0 * n_targets)
+        fig_width = fig_height * 4.0 / 3.0
+        fig = plt.figure(figsize=(fig_width, fig_height))
         gs = GridSpec(n_targets, 4, figure=fig,
                       width_ratios=[2.0, 1.0, 1.0, 1.0],
-                      hspace=0.35, wspace=0.30)
+                      hspace=0.55, wspace=0.40)
 
         # ── 左侧：3D 组合轨迹图 ──
         ax_3d = fig.add_subplot(gs[:, 0], projection="3d")
@@ -86,22 +109,28 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
             yp = preds_raw[sample_idx, :, base + 1]
             zp = preds_raw[sample_idx, :, base + 2]
 
-            ax_3d.plot(xk, yk, zk, color=color, linestyle="-", alpha=0.4, linewidth=1.2)
-            ax_3d.plot(xt, yt, zt, color=color, linestyle="-", linewidth=2.0)
-            ax_3d.plot(xp, yp, zp, color=color, linestyle="--", linewidth=1.5)
+            ax_3d.plot(xk, yk, zk, color=color, linestyle="-", alpha=0.4, linewidth=3)
+            ax_3d.plot(xt, yt, zt, color=color, linestyle="-", linewidth=3)
+            ax_3d.plot(xp, yp, zp, color=color, linestyle="--", linewidth=3)
+            # 连接 Known 末点与 True / Pred 首点
+            ax_3d.plot([xk[-1], xt[0]], [yk[-1], yt[0]], [zk[-1], zt[0]],
+                       color=color, linestyle="-", linewidth=3)
+            ax_3d.plot([xk[-1], xp[0]], [yk[-1], yp[0]], [zk[-1], zp[0]],
+                       color=color, linestyle="--", linewidth=3)
 
         # 3D legend
         ax_3d.plot([], [], [], color="gray", linestyle="-", alpha=0.4,
-                   linewidth=1.2, label="Known")
-        ax_3d.plot([], [], [], color="gray", linestyle="-", linewidth=2.0,
+                   linewidth=3, label="Known")
+        ax_3d.plot([], [], [], color="gray", linestyle="-", linewidth=3,
                    label="True")
-        ax_3d.plot([], [], [], color="gray", linestyle="--", linewidth=1.5,
+        ax_3d.plot([], [], [], color="gray", linestyle="--", linewidth=3,
                    label="Predicted")
-        ax_3d.legend(loc="best", fontsize=8)
-        ax_3d.set_xlabel("$x$ (km)")
-        ax_3d.set_ylabel("$y$ (km)")
-        ax_3d.set_zlabel("$z$ (km)") # type: ignore
-        ax_3d.set_title("3D Trajectories", fontsize=10)
+        ax_3d.legend(loc="best")
+        ax_3d.set_xlabel("$x$ (km)", labelpad=20)
+        ax_3d.set_ylabel("$y$ (km)", labelpad=20)
+        ax_3d.set_zlabel("$z$ (km)", labelpad=20) # type: ignore
+        ax_3d.tick_params(pad=12)
+        ax_3d.set_title("3D Trajectories")
 
         # ── 右侧：位置分量子图 ──
         for t in range(n_targets):
@@ -112,34 +141,58 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
                 ax = fig.add_subplot(gs[t, c + 1])
 
                 ax.plot(time_known, X_raw[sample_idx, :, base + offset],
-                        color=color, linestyle="-", alpha=0.5, linewidth=1.0)
+                        color=color, linestyle="-", alpha=0.5, linewidth=3)
                 ax.plot(time_future, gt_raw[sample_idx, :, base + offset],
-                        color=color, linestyle="-", linewidth=1.8)
+                        color=color, linestyle="-", linewidth=3)
                 ax.plot(time_future, preds_raw[sample_idx, :, base + offset],
-                        color=color, linestyle="--", linewidth=1.2)
+                        color=color, linestyle="--", linewidth=3)
+                # 连接 Known 末点与 True / Pred 首点
+                last_known = X_raw[sample_idx, -1, base + offset]
+                first_true = gt_raw[sample_idx, 0, base + offset]
+                first_pred = preds_raw[sample_idx, 0, base + offset]
+                ax.plot([time_known[-1], time_future[0]], [last_known, first_true],
+                        color=color, linestyle="-", linewidth=3)
+                ax.plot([time_known[-1], time_future[0]], [last_known, first_pred],
+                        color=color, linestyle="--", linewidth=3)
 
                 # Divider between known and future
                 ax.axvline(x=630, color="gray", linestyle=":",
                            alpha=0.5, linewidth=0.8)
 
-                ax.set_ylabel(f"${axis_label}$ (km)", fontsize=8)
+                ax.set_ylabel(f"${axis_label}$ (km)")
                 if t == n_targets - 1:
-                    ax.set_xlabel("$t$ (s)", fontsize=8)
+                    ax.set_xlabel("$t$ (s)")
                 if t == 0:
-                    ax.set_title(f"${axis_label}$", fontsize=9)
-                ax.tick_params(labelsize=7)
+                    ax.set_title(f"${axis_label}$")
+                ax.tick_params()
                 ax.grid(True, alpha=0.25)
 
         # ── 总标题 ──
         fig.suptitle(f"Top-{rank} | Terminal distance: {dist_val:.4f} km | $N$ = {n_targets}",
-                     fontsize=13, fontweight="bold", y=0.99)
+                     fontweight="bold", y=0.99)
 
-        # ── 保存 ──
+        # ── 保存 SVG ──
         save_name = f"top{rank:02d}_dist{dist_val:.4f}_N{n_targets}.png"
         save_path = os.path.join(output_dir, save_name)
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
+        fig.savefig(save_path, dpi=72)
         plt.close(fig)
-        print(f"  [{rank}/{len(top_indices)}] 已保存: {save_name}")
+
+        # ── 保存对应 .mat 数据文件 ──
+        mat_name = save_name.replace(".png", ".mat")
+        mat_path = os.path.join(output_dir, mat_name)
+        mat_data = {
+            "time_known": time_known,           # (10,) s
+            "time_future": time_future,         # (10,) s
+            "N": n_targets,                     # scalar
+        }
+        for t in range(n_targets):
+            base = t * 6
+            for comp, comp_name in enumerate(["x", "y", "z"]):
+                mat_data[f"{comp_name}_known_{t+1}"] = X_raw[sample_idx, :, base + comp]
+                mat_data[f"{comp_name}_true_{t+1}"] = gt_raw[sample_idx, :, base + comp]
+                mat_data[f"{comp_name}_pred_{t+1}"] = preds_raw[sample_idx, :, base + comp]
+        sio.savemat(mat_path, mat_data)
+        print(f"  [{rank}/{len(top_indices)}] 已保存: {save_name} 及 {mat_name}")
 
 
 def compute_terminal_distance(pred_raw, gt_raw, masks):
@@ -202,8 +255,12 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
     model_type = checkpoint.get("model_type", "lstm")
+    term_dist_info = ""
+    if "val_terminal_dist" in checkpoint:
+        term_dist = checkpoint["val_terminal_dist"]
+        term_dist_info = f", terminal_dist={term_dist:.4f} km"
     print(f"模型已加载: {model_path} (epoch {checkpoint['epoch']}, "
-          f"val_loss={checkpoint['val_loss']:.6f}, type={model_type})")
+          f"val_loss={checkpoint['val_loss']:.6f}{term_dist_info}, type={model_type})")
 
     # ── 读取并解析输入数据 ──
     samples, masks = parse_csv(input_path)
@@ -296,10 +353,13 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
         top_indices = top_indices[final_order]
 
         vis_dir = os.path.join(OUTPUT_DIR, "best_predictions")
-        # 清空已有目录
+        # 清空已有 SVG/MAT/PNG 文件，保留其他文件（如 .m 脚本）
         if os.path.exists(vis_dir):
-            shutil.rmtree(vis_dir)
-        os.makedirs(vis_dir, exist_ok=True)
+            for fname in os.listdir(vis_dir):
+                if fname.lower().endswith(('.png', '.mat', '.png')):
+                    os.remove(os.path.join(vis_dir, fname))
+        else:
+            os.makedirs(vis_dir, exist_ok=True)
 
         print(f"\n生成最佳预测可视化图，保存至: {vis_dir}")
         visualize_best_predictions(
@@ -314,7 +374,7 @@ def main():
     parser.add_argument("--input", type=str, default=None,
                         help="输入 CSV 文件路径（默认使用测试集第一个样本演示）")
     parser.add_argument("--output", type=str, default=None,
-                        help="输出 CSV 文件路径（默认保存到 output/predictions.csv）")
+                        help="输出 CSV 文件路径（默认保存到 output/X_pred.csv）")
     parser.add_argument("--model", type=str, default=MODEL_SAVE_PATH,
                         help="模型权重路径")
     parser.add_argument("--scaler", type=str, default=SCALER_SAVE_PATH,
@@ -338,7 +398,7 @@ def main():
     output_path = args.output
     if output_path is None:
         os.makedirs(OUTPUT_DIR, exist_ok=True)
-        output_path = os.path.join(OUTPUT_DIR, "predictions.csv")
+        output_path = os.path.join(OUTPUT_DIR, "X_pred.csv")
 
     ground_truth_path = args.ground_truth
     if ground_truth_path is None:

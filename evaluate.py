@@ -5,11 +5,25 @@
 """
 
 import os
+import sys
+
+# ── conda MKL DLL 搜索路径修复 (Windows) ──
+if sys.platform == "win32":
+    _conda_lib_bin_candidates = [
+        os.environ.get("CONDA_PREFIX", ""),
+        sys.prefix,
+    ]
+    for _prefix in _conda_lib_bin_candidates:
+        _lib_bin = os.path.join(_prefix, "Library", "bin") if _prefix else ""
+        if _lib_bin and os.path.isdir(_lib_bin) and _lib_bin not in os.environ.get("PATH", ""):
+            os.environ["PATH"] = _lib_bin + os.pathsep + os.environ.get("PATH", "")
+
 import torch
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import scipy.io as sio
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 
 from config import (
@@ -24,9 +38,18 @@ from utils.data_loader import (
 from models.model import create_model
 
 
-# 设置中文字体
+# 设置中文字体与全局字号
 matplotlib.rcParams["font.sans-serif"] = ["SimHei", "Microsoft YaHei", "DejaVu Sans"]
 matplotlib.rcParams["axes.unicode_minus"] = False
+matplotlib.rcParams.update({
+    "font.size": 20,
+    "axes.titlesize": 20,
+    "axes.labelsize": 20,
+    "xtick.labelsize": 18,
+    "ytick.labelsize": 18,
+    "legend.fontsize": 20,
+    "figure.titlesize": 20,
+})
 
 
 def compute_cw_metrics(preds_raw, masks, dv_all=None):
@@ -172,8 +195,8 @@ def plot_predictions(preds, targets, masks, scaler, num_samples=5, save_dir=OUTP
         n_valid = mask.sum().item()    # 有效特征数
         n_agents = n_valid // 6
 
-        fig = plt.figure(figsize=(16, 5 * n_agents))
-        fig.suptitle(f"样本 #{sample_idx} (N={n_agents})", fontsize=14)
+        fig = plt.figure(figsize=(8 * n_agents, 6 * n_agents))
+        fig.suptitle(f"样本 #{sample_idx} (N={n_agents})")
 
         time_steps = np.arange(10)
 
@@ -183,9 +206,9 @@ def plot_predictions(preds, targets, masks, scaler, num_samples=5, save_dir=OUTP
             # ── 3D 位置图 ──
             ax3d = fig.add_subplot(n_agents, 4, agent * 4 + 1, projection="3d")
             ax3d.plot(true[:, base + 0], true[:, base + 1], true[:, base + 2],
-                      "b-", linewidth=2, label="真实")
+                      "b-o", linewidth=3, markersize=5, label="真实")
             ax3d.plot(pred[:, base + 0], pred[:, base + 1], pred[:, base + 2],
-                      "r--", linewidth=2, label="预测")
+                      "r--s", linewidth=3, markersize=5, label="预测")
             ax3d.scatter(true[0, base + 0], true[0, base + 1], true[0, base + 2],
                          c="blue", s=50, marker="o") # type: ignore
             ax3d.scatter(pred[0, base + 0], pred[0, base + 1], pred[0, base + 2],
@@ -194,43 +217,56 @@ def plot_predictions(preds, targets, masks, scaler, num_samples=5, save_dir=OUTP
             ax3d.set_ylabel("Y (km)")
             ax3d.set_zlabel("Z (km)") # type: ignore
             ax3d.set_title(f"目标 {agent+1} 3D 轨迹")
-            ax3d.legend(fontsize=7)
+            ax3d.legend()
 
             # ── X 分量 ──
             ax_x = fig.add_subplot(n_agents, 4, agent * 4 + 2)
-            ax_x.plot(time_steps, true[:, base + 0], "b-o", markersize=4, label="真实")
-            ax_x.plot(time_steps, pred[:, base + 0], "r--s", markersize=4, label="预测")
+            ax_x.plot(time_steps, true[:, base + 0], "b-o", linewidth=3, markersize=6, label="真实")
+            ax_x.plot(time_steps, pred[:, base + 0], "r--s", linewidth=3, markersize=6, label="预测")
             ax_x.set_xlabel("时间步")
             ax_x.set_ylabel("X (km)")
             ax_x.set_title(f"目标 {agent+1} X 分量")
-            ax_x.legend(fontsize=7)
+            ax_x.legend()
             ax_x.grid(True, alpha=0.3)
 
             # ── Y 分量 ──
             ax_y = fig.add_subplot(n_agents, 4, agent * 4 + 3)
-            ax_y.plot(time_steps, true[:, base + 1], "b-o", markersize=4, label="真实")
-            ax_y.plot(time_steps, pred[:, base + 1], "r--s", markersize=4, label="预测")
+            ax_y.plot(time_steps, true[:, base + 1], "b-o", linewidth=3, markersize=6, label="真实")
+            ax_y.plot(time_steps, pred[:, base + 1], "r--s", linewidth=3, markersize=6, label="预测")
             ax_y.set_xlabel("时间步")
             ax_y.set_ylabel("Y (km)")
             ax_y.set_title(f"目标 {agent+1} Y 分量")
-            ax_y.legend(fontsize=7)
+            ax_y.legend()
             ax_y.grid(True, alpha=0.3)
 
             # ── Z 分量 ──
             ax_z = fig.add_subplot(n_agents, 4, agent * 4 + 4)
-            ax_z.plot(time_steps, true[:, base + 2], "b-o", markersize=4, label="真实")
-            ax_z.plot(time_steps, pred[:, base + 2], "r--s", markersize=4, label="预测")
+            ax_z.plot(time_steps, true[:, base + 2], "b-o", linewidth=3, markersize=6, label="真实")
+            ax_z.plot(time_steps, pred[:, base + 2], "r--s", linewidth=3, markersize=6, label="预测")
             ax_z.set_xlabel("时间步")
             ax_z.set_ylabel("Z (km)")
             ax_z.set_title(f"目标 {agent+1} Z 分量")
-            ax_z.legend(fontsize=7)
+            ax_z.legend()
             ax_z.grid(True, alpha=0.3)
 
         plt.tight_layout()
         save_path = os.path.join(save_dir, f"sample_{sample_idx:05d}.png")
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.savefig(save_path, dpi=130, bbox_inches="tight")
         plt.close()
         print(f"图表已保存: {save_path}")
+
+        # ── 保存对应 .mat 数据文件 ──
+        mat_path = save_path.replace(".png", ".mat")
+        mat_data = {
+            "time_steps": time_steps,           # (10,)
+            "true_trajectory": true,             # (10, 24)
+            "pred_trajectory": pred,             # (10, 24)
+            "mask": mask,                        # (24,)
+            "n_agents": n_agents,                # scalar
+            "sample_idx": np.int32(sample_idx),  # scalar
+        }
+        sio.savemat(mat_path, mat_data)
+        print(f"  └─ 数据已保存: {mat_path}")
 
 
 def plot_loss_curve(log_path=os.path.join(os.path.dirname(__file__), "output", "train_log.txt"),
@@ -298,16 +334,16 @@ def plot_loss_curve(log_path=os.path.join(os.path.dirname(__file__), "output", "
 
     # 主 loss 图
     fig, axes = plt.subplots(1, 2 if train_pred else 1,
-                              figsize=(14 if train_pred else 7, 5))
+                              figsize=(12 if train_pred else 8, 9 if train_pred else 6))
     if train_pred:
         ax1, ax2 = axes[0], axes[1]
     else:
         ax1 = axes
     epochs = range(1, len(train_total) + 1)
 
-    ax1.plot(epochs, train_total, "b-", linewidth=1.5, label="训练总损失")
+    ax1.plot(epochs, train_total, "b-", linewidth=3, markersize=3, label="训练总损失")
     if val_total:
-        ax1.plot(epochs[:len(val_total)], val_total, "r-", linewidth=1.5, label="验证总损失")
+        ax1.plot(epochs[:len(val_total)], val_total, "r-", linewidth=3, markersize=3, label="验证总损失")
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("MSE Loss")
     ax1.set_title("训练 / 验证损失曲线")
@@ -315,22 +351,42 @@ def plot_loss_curve(log_path=os.path.join(os.path.dirname(__file__), "output", "
     ax1.grid(True, alpha=0.3)
 
     if train_pred:
-        ax2.plot(epochs[:len(train_pred)], train_pred, "b-", linewidth=1, label="训练预测损失") # type: ignore
-        ax2.plot(epochs[:len(train_phy)], train_phy, "g-", linewidth=1, label="训练物理损失") # type: ignore
-        ax2.plot(epochs[:len(train_mode)], train_mode, "m-", linewidth=1, label="训练模式损失") # type: ignore
+        ax2.plot(epochs[:len(train_pred)], train_pred, "b-", linewidth=3, markersize=3, label="训练预测损失") # type: ignore
+        ax2.plot(epochs[:len(train_phy)], train_phy, "g-", linewidth=3, markersize=3, label="训练物理损失") # type: ignore
+        ax2.plot(epochs[:len(train_mode)], train_mode, "m-", linewidth=3, markersize=3, label="训练模式损失") # type: ignore
         if val_pred:
-            ax2.plot(epochs[:len(val_pred)], val_pred, "r--", linewidth=1, label="验证预测损失") # type: ignore
+            ax2.plot(epochs[:len(val_pred)], val_pred, "r--", linewidth=3, markersize=3, label="验证预测损失") # type: ignore
         ax2.set_xlabel("Epoch") # type: ignore
         ax2.set_ylabel("Loss") # type: ignore
         ax2.set_title("损失各分量") # type: ignore
-        ax2.legend(fontsize=7) # type: ignore
+        ax2.legend() # type: ignore
         ax2.grid(True, alpha=0.3) # type: ignore
 
     plt.tight_layout()
     save_path = os.path.join(save_dir, "loss_curve.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close()
     print(f"Loss 曲线已保存: {save_path}")
+
+    # ── 保存对应 .mat 数据文件 ──
+    mat_path = save_path.replace(".png", ".mat")
+    len_data = len(train_total)
+    mat_data = {
+        "epoch": np.arange(1, len_data + 1, dtype=np.int32),
+        "train_total": np.array(train_total),
+    }
+    if train_pred:
+        mat_data["train_pred"] = np.array(train_pred)[:len_data]
+        mat_data["train_phy"] = np.array(train_phy)[:len_data]
+        mat_data["train_mode"] = np.array(train_mode)[:len_data]
+    if val_pred:
+        mat_data["val_pred"] = np.array(val_pred)[:len_data]
+    if val_phy:
+        mat_data["val_phy"] = np.array(val_phy)[:len_data]
+    if val_total:
+        mat_data["val_total"] = np.array(val_total)[:len_data]
+    sio.savemat(mat_path, mat_data)
+    print(f"  └─ 数据已保存: {mat_path}")
 
 
 def plot_dv_distribution(dv_all, masks, save_dir=OUTPUT_DIR):
@@ -350,7 +406,7 @@ def plot_dv_distribution(dv_all, masks, save_dir=OUTPUT_DIR):
     if not dv_mags_all:
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 12))
 
     # 幅值分布直方图
     ax1 = axes[0]
@@ -382,9 +438,22 @@ def plot_dv_distribution(dv_all, masks, save_dir=OUTPUT_DIR):
 
     plt.tight_layout()
     save_path = os.path.join(save_dir, "dv_distribution.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close()
     print(f"Δv 分布图已保存: {save_path}")
+
+    # ── 保存对应 .mat 数据文件 ──
+    mat_path = save_path.replace(".png", ".mat")
+    mat_data = {
+        "dv_magnitudes": np.array(dv_mags_all) * 1000,  # m/s
+    }
+    if dv_components:
+        dv_cat = np.concatenate(dv_components, axis=0) * 1000  # m/s
+        mat_data["dvx"] = dv_cat[:, 0]
+        mat_data["dvy"] = dv_cat[:, 1]
+        mat_data["dvz"] = dv_cat[:, 2]
+    sio.savemat(mat_path, mat_data)
+    print(f"  └─ 数据已保存: {mat_path}")
 
 
 def plot_cw_residual_curve(cw_residuals, save_dir=OUTPUT_DIR):
@@ -392,7 +461,7 @@ def plot_cw_residual_curve(cw_residuals, save_dir=OUTPUT_DIR):
     if not cw_residuals:
         return
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(16, 12))
 
     ax1 = axes[0]
     ax1.hist(cw_residuals, bins=50, color="coral", edgecolor="white", alpha=0.8)
@@ -407,9 +476,17 @@ def plot_cw_residual_curve(cw_residuals, save_dir=OUTPUT_DIR):
 
     plt.tight_layout()
     save_path = os.path.join(save_dir, "cw_residual.png")
-    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.savefig(save_path, dpi=130, bbox_inches="tight")
     plt.close()
     print(f"CW 残差图已保存: {save_path}")
+
+    # ── 保存对应 .mat 数据文件 ──
+    mat_path = save_path.replace(".png", ".mat")
+    mat_data = {
+        "cw_residuals": np.array(cw_residuals),  # km/s
+    }
+    sio.savemat(mat_path, mat_data)
+    print(f"  └─ 数据已保存: {mat_path}")
 
 
 def main():
@@ -451,7 +528,12 @@ def main():
         model.load_state_dict(model_state)
         print(f"部分加载: {loaded} 层匹配, {skipped} 层跳过（随机初始化）")
 
-    print(f"模型类型: {model_type}, epoch {checkpoint['epoch']}, val_loss={checkpoint['val_loss']:.6f}")
+    term_dist_info = ""
+    if "val_terminal_dist" in checkpoint:
+        term_dist = checkpoint["val_terminal_dist"]
+        term_dist_info = f", terminal_dist={term_dist:.4f} km"
+    print(f"模型类型: {model_type}, epoch {checkpoint['epoch']}, "
+          f"val_loss={checkpoint['val_loss']:.6f}{term_dist_info}")
 
     # ── 评估 ──
     preds, targets, masks, metrics = evaluate_model(model, test_loader, scaler, DEVICE)

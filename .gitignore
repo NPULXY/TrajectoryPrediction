@@ -1,12 +1,49 @@
+# ──────────── Python ────────────
 __pycache__/
 *.py[cod]
-*.pth
-*.pkl
-output/
-.ipynb_checkpoints/
+*$py.class
 *.egg-info/
 .eggs/
+.ipynb_checkpoints/
+
+# ──────────── 构建产物 ────────────
 dist/
 build/
-.vscode/
+
+# ──────────── 模型权重与标准化器（体积大，不入库）────────────
+*.pth
+*.pt
+*.pkl
+*.ckpt
+
+# ──────────── 数据集（体积大，不入库）────────────
 Dataset_Summary/
+Dataset_new2/
+
+# ──────────── 训练/评估产物 ────────────
+output/
+*.zip
+*.mat
+*.npy
+*.npz
+
+# ──────────── 归档目录（历史权重、旧备份、.bak）────────────
+_archive/
+
+# ──────────── IDE / OS ────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ──────────── 临时与备份文件 ────────────
+*.bak
+*.bak_*
+*.tmp
+*_tmp.*
+*~
+
+# ──────────── 日志 ────────────
+*.log

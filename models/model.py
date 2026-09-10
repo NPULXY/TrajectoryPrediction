@@ -147,25 +147,32 @@ class TrajectoryLSTM(nn.Module):
 
 
 def create_model(device=None):
-    """工厂函数：根据配置创建模型并移至指定设备。
+    """工厂函数：默认返回 v5 Transformer-PI 模型（当前最佳架构）。
 
-    当 PHYSICS_ENABLED=True 时返回物理信息条件 LSTM，
-    否则返回标准 TrajectoryLSTM（向后兼容）。
+    配置开关：
+    - USE_TRANSFORMER=False → v3 PI-LSTM
+    - USE_TRANSFORMER=True（默认） → v5 Transformer-PI
     """
     try:
-        from config import PHYSICS_ENABLED, CONDITION_EMBED_DIM
+        from config import USE_TRANSFORMER, PHYSICS_ENABLED, CONDITION_EMBED_DIM
     except ImportError:
-        PHYSICS_ENABLED = False
+        USE_TRANSFORMER = True
+        PHYSICS_ENABLED = True
         CONDITION_EMBED_DIM = 8
 
-    if PHYSICS_ENABLED:
+    if USE_TRANSFORMER:
+        from models.transformer_pi import create_transformer_pi
+        model = create_transformer_pi(device, CONDITION_EMBED_DIM)
+    elif PHYSICS_ENABLED:
         from models.pinn_lstm import PhysicsInformedTrajectoryLSTM
         model = PhysicsInformedTrajectoryLSTM(condition_embed_dim=CONDITION_EMBED_DIM)
+        if device is not None:
+            model = model.to(device)
     else:
         model = TrajectoryLSTM()
+        if device is not None:
+            model = model.to(device)
 
-    if device is not None:
-        model = model.to(device)
     return model
 
 
