@@ -30,7 +30,7 @@ import torch.nn.functional as F
 
 from config import (
     MAX_DIM, INPUT_STEPS, OUTPUT_STEPS,
-    D_MODEL, DROPOUT,
+    D_MODEL, DROPOUT, CW_DT_H, PI_HIDDEN_SIZE, PI_NUM_LAYERS,
 )
 from models.physics_loss import (
     N_MEAN, compute_cw_matrix, compute_cw_B_eff, estimate_delta_v_from_states,
@@ -44,7 +44,7 @@ class DeltaVEstimator(nn.Module):
     从状态序列中估计速度增量 Δv 的可微模块（全向量化实现）。
     """
 
-    def __init__(self, n=N_MEAN, dt=1.0, use_learnable_correction=False):
+    def __init__(self, n=N_MEAN, dt=CW_DT_H, use_learnable_correction=False):
         super().__init__()
         self.n = n
         self.dt = dt
@@ -56,9 +56,11 @@ class DeltaVEstimator(nn.Module):
         BtB_inv = torch.linalg.inv(BtB)
         B_pinv = BtB_inv @ B_eff.T  # (3, 6)
 
-        self.register_buffer("Phi", Phi)
-        self.register_buffer("B_eff", B_eff)
-        self.register_buffer("B_pinv", B_pinv)
+        # persistent=False：这三者是由物理常量派生的常量矩阵，不应写入 checkpoint。
+        # 否则修改 CW_DT_H 后加载旧权重会沿用错误步长的矩阵（形状相同，strict 加载不报错）。
+        self.register_buffer("Phi", Phi, persistent=False)
+        self.register_buffer("B_eff", B_eff, persistent=False)
+        self.register_buffer("B_pinv", B_pinv, persistent=False)
 
         if use_learnable_correction:
             self.correction_net = nn.Sequential(
@@ -128,11 +130,12 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
     def __init__(
         self,
         input_dim=MAX_DIM,
-        hidden_size=384,
-        num_layers=4,
+        hidden_size=PI_HIDDEN_SIZE,
+        num_layers=PI_NUM_LAYERS,
         dropout=DROPOUT,
         condition_embed_dim=8,
         max_N=4,
+        scaler=None,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -141,8 +144,19 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
         self.condition_embed_dim = condition_embed_dim
         self.max_N = max_N
 
-        self.dv_estimator = DeltaVEstimator(use_learnable_correction=False)
+        self.dv_estimator = DeltaVEstimator(dt=CW_DT_H, use_learnable_correction=False)
         self.condition_builder = ConditionBuilder(embed_dim=condition_embed_dim)
+
+        # ── 标准化参数（persistent=False，不写入 checkpoint）──
+        # 用途：Δv 估计必须在**物理空间**进行，而输入 x 是标准化后的数据。
+        if scaler is not None and scaler.mean is not None and scaler.std is not None:
+            self.register_buffer(
+                "_feat_mean", torch.from_numpy(scaler.mean.astype("float32")), persistent=False)
+            self.register_buffer(
+                "_feat_std", torch.from_numpy(scaler.std.astype("float32")), persistent=False)
+        else:
+            self._feat_mean = None
+            self._feat_std = None
 
         lstm_input_dim = max_N * (6 + condition_embed_dim)
 
@@ -207,6 +221,18 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
             elif p.dim() > 1:
                 nn.init.xavier_uniform_(p)
 
+    def _to_physical(self, x_norm):
+        """
+        标准化张量 → 原始物理量纲（倒数第二维为特征维）。
+
+        ⚠️ 2026-09-10 新增：CW 矩阵 Φ / B_eff 是**物理量纲**的，Δv 估计必须作用在物理空间。
+        原实现直接对标准化数据调用 DeltaVEstimator，实测所得 Δv 比物理真值大两个数量级
+        （标准化数据量级 ~1，而 Phi[0,3]≈60，会放大 60 倍后与 B_pinv 组合，结果无物理意义）。
+        """
+        if self._feat_mean is None or self._feat_std is None:
+            return x_norm
+        return x_norm * (self._feat_std + 1e-8) + self._feat_mean
+
     def _build_expanded_input(self, states, condition, mask):
         B, T, _ = states.shape
         max_N = self.max_N
@@ -230,7 +256,8 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
         context = (encoder_out * attn).sum(dim=1)  # (B, hidden)
         return context
 
-    def forward(self, x, target=None, teacher_forcing_ratio=0.0, return_dv=True, mask=None, baseline=None):
+    def forward(self, x, target=None, teacher_forcing_ratio=0.0, return_dv=True, mask=None,
+                baseline=None, augment_std=0.0):
         """
         Args:
             x: (B, 10, max_dim) 观测序列
@@ -241,6 +268,10 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
             baseline: (B, OUTPUT_STEPS, max_dim) 标准化空间的 CW baseline（v7 残差学习模式）
                      若提供：pred = baseline + delta（学残差）
                      若不提供：pred = persistence + delta（v3 默认模式）
+            augment_std: 训练期输入高斯噪声标准差（标准化空间）。
+                     ⚠️ 2026-09-10 设计约束：噪声**仅施加于 LSTM 输入分支**，
+                     Δv 估计始终使用干净输入。因为噪声经 CW 逆推伪逆会被放大约 5 倍
+                     （实测 std=0.02 时 Δv alignment 损失从 0.7 飙升至 32），会污染物理约束。
         """
         B = x.shape[0]
         device = x.device
@@ -248,8 +279,9 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
         if mask is None:
             mask = torch.ones(B, self.input_dim, dtype=torch.bool, device=device)
 
-        # 1. Δv 估计
-        dv_all_input = self.dv_estimator(x, mask)  # (B, 9, max_N*3)
+        # 1. Δv 估计（⚠️ 必须在**物理空间**进行，且使用**干净输入**，见 augment_std 说明）
+        x_phys = self._to_physical(x)
+        dv_all_input = self.dv_estimator(x_phys, mask)  # (B, 9, max_N*3)，物理量纲 km/s
 
         # 2. 全局 Δv 聚合
         max_N = self.max_N
@@ -264,8 +296,11 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
         last_cond = condition_input[:, -1:, :]
         condition_input = torch.cat([condition_input, last_cond], dim=1)  # (B, 10, embed_dim)
 
-        # 4. 扩展输入
-        expanded_input = self._build_expanded_input(x, condition_input, mask)  # (B, 10, lstm_input_dim)
+        # 4. 扩展输入（训练期可加噪；Δv 分支已在上方用干净输入独立完成）
+        x_lstm = x
+        if self.training and augment_std > 0:
+            x_lstm = x + torch.randn_like(x) * augment_std * mask.unsqueeze(1).float()
+        expanded_input = self._build_expanded_input(x_lstm, condition_input, mask)  # (B, 10, lstm_input_dim)
 
         # 5. Encoder LSTM
         encoder_out, (h_n, c_n) = self.encoder_lstm(expanded_input)  # (B, 10, hidden)
@@ -291,17 +326,17 @@ class PhysicsInformedTrajectoryLSTM(nn.Module):
             persistence = x[:, -1:, :].repeat(1, OUTPUT_STEPS, 1)
             pred = persistence + delta
 
-        # 9. Δv 计算（从预测速度差分）
+        # 9. Δv 计算（**脉冲 Δv**：扣除 CW 自由演化，与 CW 逆推结果语义一致）
+        #    ⚠️ 2026-09-10 修正：原实现直接取相邻步速度差分，其中含 CW 自由演化贡献
+        #    （60 s 内约 4 m/s），而 dv_all_input 是 CW 逆推的**脉冲** Δv，两者语义不匹配，
+        #    导致 L_align 无法收敛（实测该分量因此从 0.157 升至 0.843）。
         if return_dv:
-            # pred velocity: pred[:, :, 3::6] for each agent
-            # 简化为: 取每个 agent 的 velocity (位置基 3:6)
-            # 但 24 维是 (x,y,z,vx,vy,vz) × max_N，要按 agent 切片
-            pred_vel_full = pred.reshape(B, OUTPUT_STEPS, max_N, 6)[..., 3:6]  # (B, 10, max_N, 3)
-            dv_pred = pred_vel_full[:, 1:] - pred_vel_full[:, :-1]  # (B, 9, max_N, 3) - vel 增量
-            # 但 dv_pred 与 CW 估计的 Δv 含义不同：CW 估计是 1s 内的脉冲 Δv，vel diff 是 1s 内的速度差
-            # 在 CW 模型下：vel_diff = dv_pulse + 自由演化带来的速度变化
-            # 这里为对齐 dv_alignment：直接将 dv_pred 与 dv_all_input 比较（仅前 9 步）
-            dv_pred_flat = dv_pred.reshape(B, 9, max_N * 3)
+            Phi = self.dv_estimator.Phi                              # (6, 6)
+            pred_phys = self._to_physical(pred)                      # 同样需在物理空间反解
+            s_pred = pred_phys.reshape(B, OUTPUT_STEPS, max_N, 6)
+            s_pred_free = s_pred[:, :-1] @ Phi.T                     # (B, 9, max_N, 6)
+            dv_pred = s_pred[:, 1:, :, 3:6] - s_pred_free[..., 3:6]  # (B, 9, max_N, 3)
+            dv_pred_flat = dv_pred.reshape(B, OUTPUT_STEPS - 1, max_N * 3)
             # 用 mask 处理 padding
             valid_3d = valid_agents.unsqueeze(-1).expand(-1, -1, 3).unsqueeze(1)  # (B, 1, max_N, 3)
             dv_pred_flat = dv_pred_flat * valid_3d.reshape(B, 1, max_N * 3)

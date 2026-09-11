@@ -146,17 +146,24 @@ class TrajectoryLSTM(nn.Module):
         return persistence + deltas
 
 
-def create_model(device=None):
-    """工厂函数：默认返回 v5 Transformer-PI 模型（当前最佳架构）。
+def create_model(device=None, scaler=None):
+    """
+    工厂函数 —— 根据 config 创建模型。
 
     配置开关：
-    - USE_TRANSFORMER=False → v3 PI-LSTM
-    - USE_TRANSFORMER=True（默认） → v5 Transformer-PI
+    - USE_TRANSFORMER=True  → v5 Transformer-PI
+    - USE_TRANSFORMER=False 且 PHYSICS_ENABLED=True → v3 PI-LSTM（当前主线）
+    - PHYSICS_ENABLED=False → 标准 LSTM
+
+    Args:
+        device: 目标设备
+        scaler: FeatureScaler。PI-LSTM 需要它把标准化输入还原到物理空间以估计 Δv
+                （2026-09-10 起传入；缺省为 None 时 Δv 估计将失去物理意义）
     """
     try:
         from config import USE_TRANSFORMER, PHYSICS_ENABLED, CONDITION_EMBED_DIM
     except ImportError:
-        USE_TRANSFORMER = True
+        USE_TRANSFORMER = False
         PHYSICS_ENABLED = True
         CONDITION_EMBED_DIM = 8
 
@@ -165,7 +172,8 @@ def create_model(device=None):
         model = create_transformer_pi(device, CONDITION_EMBED_DIM)
     elif PHYSICS_ENABLED:
         from models.pinn_lstm import PhysicsInformedTrajectoryLSTM
-        model = PhysicsInformedTrajectoryLSTM(condition_embed_dim=CONDITION_EMBED_DIM)
+        model = PhysicsInformedTrajectoryLSTM(condition_embed_dim=CONDITION_EMBED_DIM,
+                                              scaler=scaler)
         if device is not None:
             model = model.to(device)
     else:

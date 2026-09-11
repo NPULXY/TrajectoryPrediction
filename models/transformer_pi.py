@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from config import (
-    MAX_DIM, INPUT_STEPS, OUTPUT_STEPS, DROPOUT,
+    MAX_DIM, INPUT_STEPS, OUTPUT_STEPS, DROPOUT, CW_DT_H,
 )
 from models.physics_loss import (
     N_MEAN, compute_cw_matrix, compute_cw_B_eff,
@@ -37,7 +37,7 @@ from models.physics_loss import (
 # ==================== Δv 估计模块（与 v3 同）====================
 
 class DeltaVEstimator(nn.Module):
-    def __init__(self, n=N_MEAN, dt=1.0):
+    def __init__(self, n=N_MEAN, dt=CW_DT_H):   # 2026-09-10: 步长由 1.0 修正为实测值 60.0
         super().__init__()
         self.n = n
         self.dt = dt

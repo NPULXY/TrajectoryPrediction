@@ -35,25 +35,38 @@ python evaluate.py    # 测试集评估 + 可视化（约 30 s）
 python predict.py     # 推理 + 最佳样本可视化（约 1 min）
 ```
 
-## ⚠️ 已知陷阱（务必先读）
+## ⚠️ 已知陷阱与修复状态
 
-1. **续训可能直接崩溃**：`train.py` 加载检查点处**无 try/except**。若 `output/latest_checkpoint.pth`
-   残留了**其他架构**的权重（例如 v5 Transformer），`load_state_dict(strict=True)` 会抛 `RuntimeError`
-   并中断。**切换架构/权重来源后必须先清理该文件**；可用 `_tools/diagnose_baseline.py` 预检。
-2. **`predict.py` 推理未传 mask**（`model(batch, return_dv=True)`，缺 `mask=`）：
-   全局 Δv 被除以 `max_N=4` 而非实际 N，导致 N=2/3 样本的条件向量与训练口径不一致。
-   实测位置偏差：N=2 平均 0.271 km / 最大 2.422 km；N=3 平均 0.171 km；N=4 无偏差。
-   **`evaluate.py` 传了 mask，是正确的**——改动时保持一致。
-3. **`hidden_size=384` / `num_layers=4` 硬编码**在 `pinn_lstm.py`，`config.py` 的
+### ✅ 已于 2026-09-10 修复
+
+| 问题 | 修复方式 |
+|------|---------|
+| **★ 时间步长错误**：数据真实步长为 **60 s**，但代码按 1 s 计算 | `config.CW_DT_H` 1.0 → **60.0**；`DeltaVEstimator(dt=)` 与 `PhysicsLoss(dt_h=)` 改为显式读 config（原为硬编码/默认值）；`Phi/B_eff/B_pinv` 改为 `persistent=False`（派生矩阵不再写入 checkpoint，避免旧权重携带错误步长矩阵） |
+| **Δv 边界约束语义错误**：对相邻步速度差分施加约束，而该差分含 60 s 自由演化（~4 m/s） | 改为约束**脉冲 Δv**（扣除 `Φ_h·x_t` 自由演化项），见 `physics_loss._velocity_change_loss` |
+| **续训无容错**：架构不匹配时 `load_state_dict` 直接抛 `RuntimeError` 且无提示 | `train.py` 加载处增加缺失键检测：缺失即抛带修复指引的异常；`strict=False` 容忍多余的派生 buffer |
+| **`predict.py` 推理未传 mask**：`dv_global` 被除以 `max_N=4` 而非实际 N | 补 `mask=batch_mask`（实测原缺陷使 N=2 位置偏差平均 0.271 km、最大 2.422 km） |
+| **`predict.py` 目录清理 bug**：`endswith(('.png','.mat','.png'))` 中 `.png` 重复、漏 `.svg`，且 `os.remove` 无容错 | 后缀集合改为 `(.png,.mat,.svg)`，逐文件 `try/except OSError` |
+| **损失曲线误导**：主曲线用"总损失"，其上升-峰值形状源自 λ_t warmup，易误读为发散 | 改为三子图：预测损失（对数轴）/ 验证末端距离 td / 物理损失分量 |
+| **CW 残差单位混标**：位置 (km) 与速度 (km/s) 混为单一欧氏范数却标 "km/s" | 拆为位置、速度两子图分别统计 |
+| **Δv 分布图口径**：绘制的"速度差分"含自由演化，超限率虚高 | 改为绘制**脉冲 Δv** 并给出超限占比 |
+| `dv_all` 步数注释（误写 19，实为 18） | 已修正 |
+
+**步长判定依据**（工具 `_tools/verify_timestep.py`）：CW 残差在 dt=60 s 时最小 ——
+X_now 3.4972→**0.2114**、X_next 4.3112→**0.3267**（小 16 倍）；旁证：序列内相邻步位移 3.5–4.4 km，
+按 1 s 对应 3.5 km/s（不合理）、按 60 s 为 0.059 km/s（合理）；修正后 CW 逆推脉冲 Δv 均值
+**3.5 m/s**，与数据集动作幅值设计值 3 m/s 吻合。
+
+### ⚠️ 仍存在（未修复）
+
+1. **`hidden_size=384` / `num_layers=4` 硬编码**在 `pinn_lstm.py`，`config.py` 的
    `D_MODEL` / `NUM_LSTM_LAYERS` **对 PI-LSTM 不生效**。
-4. **`best_val_loss` 恒为 inf**（`train()` 中初始化后从未更新）→ `latest_checkpoint.pth` 的
+2. **`best_val_loss` 恒为 inf**（`train()` 中初始化后从未更新）→ `latest_checkpoint.pth` 的
    `val_loss` 字段不可用，请改看 `val_terminal_dist`。
-5. **scheduler 跨 epoch 跳变**：`lr_lambda` 依赖 `total_epochs`，改动 `EPOCHS` 后续训会导致
+3. **scheduler 跨 epoch 跳变**：`lr_lambda` 依赖 `total_epochs`，改动 `EPOCHS` 后续训会导致
    学习率相位突变（ep81 从 1e-6 跳回 6.6e-4）；`RESUME_FIXED_LR` 补丁会被 `scheduler.step()` 覆盖。
-6. **`dv_all` 实际为 18 步**（9 CW 逆推 + 9 速度差分），代码注释多处误写为 19。
-7. **两个 `create_model` 重复**：`models/model.py` 与 `models/pinn_lstm.py` 各有一个；
-   train/evaluate/predict 均从 `models.model` 导入，`pinn_lstm` 那个是死代码。
-8. **末端距离损失被计算两次**（`multi_step_terminal_loss` 与末步 loss 叠加），实际总权重 ≈ 1.5 λ_t。
+4. **两个 `create_model` 重复**：`models/model.py` 与 `models/pinn_lstm.py` 各有一个；
+   训练实际用前者，后者是死代码。
+5. **末端距离损失被计算两次**（`multi_step_terminal_loss` 与末步 loss 叠加），实际总权重 ≈ 1.5 λ_t。
 
 ## 数据硬约束
 
@@ -62,8 +75,7 @@ python predict.py     # 推理 + 最佳样本可视化（约 1 min）
 - 每行是**单列嵌套列表字符串** `[[step1], …, [step10]]`，**必须 `json.loads` 逐行解析**，
   不能用 `pd.read_csv` 默认逗号分隔
 - N ∈ {2,3,4} → 每步 12/18/24 维，代码 padding 至 `MAX_DIM=24` 并生成 mask
-- `X_next` 可能混入 **CW 外推补齐点（步长 60 s）**，不全是 1 s 步长的真实仿真步
-  → 这是 `L_cw` 被关闭（权重 1e-7）的原因：数据不满足 `Φ_h(1s)` 单步递推假设
+- **相邻状态的真实时间间隔 = 60 s**（2026-09-10 实测判定；原数据文档标注的 "1 s" 有误）
 - `FeatureScaler` 逐维 z-score，**只统计非 padding 值**，在训练集上拟合；
   `scaler.pkl` 必须与权重配套使用，换数据集须重新拟合
 - DataLoader **num_workers 默认 0**（Windows 多进程 pickling 嵌套列表会出错）
@@ -93,7 +105,7 @@ $$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term
 | `L_term^multi`（t=3/6/9，权重 0.3/0.5/1.0，÷`TERMINAL_REF_DIST`=4.5） | 0.01→2.0 | 15 ep |
 | `L_term^last`（末步，同样归一化） | 同上 | 15 ep |
 | `L_align`（模型 Δv 对齐 CW 逆推 Δv，PI-LSTM 核心） | 0.001→0.05 | 20 ep |
-| `L_cw`（CW 单步残差，分维度归一化） | 0→**1e-7**（关闭） | 20 ep |
+| `L_cw`（CW 单步残差，分维度归一化） | 0→**0.05**（步长修正后重新启用） | 20 ep |
 | `L_bound`（Δv 越界 3 m/s 惩罚） | 0.0005→0.005 | 15 ep |
 
 前 `PRED_WARMUP_EPOCHS=3` 轮仅用 `L_Huber`。
@@ -118,7 +130,7 @@ $$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term
 | 目录 | 用途 |
 |------|------|
 | `models/`、`utils/` | 模型定义与数据管线（核心代码） |
-| `output/` | 训练与评估产物（权重/scaler/日志/图表）——**git 忽略** |
+| `output/` | 训练与评估产物：核心产物在顶层；`_logs/` 归档历史运行日志；`_archive/` 归档旧图表/旧样本/废弃集成结果——**整体 git 忽略** |
 | `_tools/` | 诊断与对比工具（有效清单见 `_tools/README.md`） |
 | `_experiments/` | v7~v11 消融脚本归档（脚本内路径引用已失效，见其 README） |
 | `_archive/v6_core/` | **v6 体系精简备份**（代码 + 2 个关键权重 + 完整说明） |

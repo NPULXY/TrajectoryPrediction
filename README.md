@@ -40,7 +40,13 @@ TrajectoryPrediction/
 ├── utils/data_loader.py         # CSV 解析 / padding / z-score / DataLoader / 指标
 ├── Dataset_Summary/             # 汇总数据集（217,642 样本，主用）
 ├── Dataset_new2/                # 交会场景子集（23,787 样本）
-├── output/                      # 训练与评估产物（权重 / scaler / 日志 / 图表）
+├── output/                      # 训练与评估产物（核心产物在顶层）
+│   ├── best_model.pth / latest_checkpoint.pth / scaler.pkl
+│   ├── train_log.txt / training_history.mat / X_pred.csv
+│   ├── loss_curve / cw_residual / dv_distribution / sample_*   # 图表（各附 .mat）
+│   ├── best_predictions/        #   最佳预测样本图（按 N 分层采样）
+│   ├── _logs/                   #   历史运行日志归档
+│   └── _archive/                #   旧图表 / 旧样本 / 废弃集成结果
 ├── _tools/                      # 诊断与对比工具（见 _tools/README.md）
 ├── _experiments/                # 消融实验脚本归档（见 _experiments/README.md）
 ├── _archive/                    # 历史权重、旧备份、.bak、v6 体系快照
@@ -140,7 +146,7 @@ $$\mathcal{L} = w_{s}\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{te
 | `L_term^multi` | t=3/6/9 的 3D 距离，阶梯权重 0.3/0.5/1.0，除以 `TERMINAL_REF_DIST=4.5` | 0.01 → 2.0 | 15 ep |
 | `L_term^last` | 末步 3D 距离，同样归一化 | 同上 | 15 ep |
 | `L_align` | 模型预测 Δv 与 CW 逆推 Δv 的对齐（PI-LSTM 核心约束） | 0.001 → 0.05 | 20 ep |
-| `L_cw` | CW 单步递推残差（分维度归一化） | 0.0 → **1e-7**（基本关闭） | 20 ep |
+| `L_cw` | CW 单步递推残差（分维度归一化） | 0.0 → **0.05**（步长修正后重新启用） | 20 ep |
 | `L_bound` | Δv 边界软约束（超出 3 m/s 惩罚，原始量纲） | 0.0005 → 0.005 | 15 ep |
 
 前 `PRED_WARMUP_EPOCHS=3` 轮仅使用 `L_Huber`。
@@ -150,8 +156,10 @@ $$\mathcal{L} = w_{s}\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{te
 导致引入数据增强后 loss 爆炸（0.02 → 9.9）。归一化后量级降至 ~1.0，梯度分配恢复均衡，
 完整 80 epoch 训练不再发散。
 
-**关于 `L_cw` 被关闭**：数据集相邻步为 1 s 间隔，但用于构建 `X_next` 的部分样本含 60 s 步长的
-CW 外推补齐点，与 `Φ_h(1s)` 假设不符，故 CW 单步残差约束不适用于本数据，仅保留极小权重作数值稳定项。
+**关于 `L_cw`（2026-09-10 修正）**：原先其权重被设为 1e-7（等同关闭），理由是"数据步长与
+`Φ_h(1s)` 假设不符"。但实测判定表明**真实步长是 60 s**（依据见下），该理由不成立。
+将 `CW_DT_H` 修正为 60 s 后，CW 残差量级下降约两个数量级，故**重新启用**物理约束（终值权重 0.05）。
+修正后 CW 逆推的脉冲 Δv 均值约 3.5 m/s，与数据集动作幅值设计值 3 m/s 吻合，佐证步长判定的正确性。
 
 ---
 
@@ -177,7 +185,8 @@ CW 外推补齐点，与 `Φ_h(1s)` 假设不符，故 CW 单步残差约束不�
   每步 N×6 个浮点数（N 个目标 × [x,y,z,vx,vy,vz]）。**必须用 `json.loads` 逐行解析，不能按逗号分列。**
 - `Y.csv`：`[N, min_distance, phi]`
 - **`X_now` / `X_next` / `Y` 行序严格对应**，且汇总版已在合并时全局打乱，**绝不可单独打乱任一文件**
-- `X_next` 可能混入 CW 外推补齐点（步长 60 s），并非全是 1 s 步长的仿真步
+- **相邻状态的真实时间间隔为 60 s**（2026-09-10 由 CW 残差判定，工具 `_tools/verify_timestep.py`）；
+  原数据文档所述"1 s 采样"不成立，其时间跨度换算亦随之修正
 - 位置单位 km，速度单位 km/s，坐标系 LVLH
 
 | 公共物理参数 | 值 |
@@ -187,6 +196,7 @@ CW 外推补齐点，与 `Φ_h(1s)` 假设不符，故 CW 单步残差约束不�
 | 轨道角速度 n | 0.001134 rad/s |
 | RL 仿真步长 h | 1 s |
 | CW 外推步长 T | 60 s |
+| **数据采样间隔（相邻状态）** | **60 s**（实测判定，2026-09-10 修正） |
 | Δv 上限 | 3 m/s |
 
 ---
@@ -234,7 +244,7 @@ CW 外推补齐点，与 `Φ_h(1s)` 假设不符，故 CW 单步残差约束不�
 | `TERMINAL_REF_DIST` | 4.5 | 末端距离损失归一化参考值（km） |
 | `TERMINAL_LOSS_WEIGHT_FINAL` | 2.0 | 末端距离损失终值权重 |
 | `MODE_LOSS_WEIGHT_FINAL` | 0.05 | Δv alignment 终值权重 |
-| `PHYSICS_LOSS_WEIGHT_FINAL` | 1e-7 | CW 残差终值权重（基本关闭） |
+| `PHYSICS_LOSS_WEIGHT_FINAL` | 0.05 | CW 残差终值权重（步长修正后重新启用） |
 | `DELTAV_LIMIT` | 3.0 | Δv 幅值上限（m/s） |
 | `RESUME_TRAINING` | `True` | 断点恢复 |
 | `RESUME_FIXED_LR` | 1e-6 | 续训时强制低学习率 |

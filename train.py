@@ -38,7 +38,10 @@ from config import (
     TERMINAL_LOSS_WEIGHT, TERMINAL_LOSS_WEIGHT_FINAL,
     TERMINAL_WARMUP_EPOCHS, MAX_N, TERMINAL_REF_DIST,
     DELTAV_BOUND_WEIGHT, DELTAV_BOUND_WEIGHT_FINAL, DELTAV_BOUND_WARMUP_EPOCHS,
-    TERMINAL_PHYSICAL,
+    TERMINAL_PHYSICAL, OUTPUT_STEPS,
+    AUGMENT_ENABLED, AUGMENT_NOISE_STD, AUGMENT_DECAY_EPOCHS,
+    SEED, RUN_TAG, PI_HIDDEN_SIZE, PI_NUM_LAYERS,
+    POS_LOSS_WEIGHT, POS_LOSS_WEIGHT_FINAL, POS_LOSS_WARMUP_EPOCHS, POS_LOSS_REF_DIST,
 )
 from utils.data_loader import (
     load_and_split, create_dataloaders, masked_mse_loss,
@@ -79,6 +82,51 @@ def huber_loss_per_sample(pred, target, mask, delta=1.0):
     n_valid_per_sample = mask_expanded.float().sum(dim=(1, 2)).clamp(min=1)  # (B,)
     loss_per_sample = (loss_per_elem * mask_expanded).sum(dim=(1, 2)) / n_valid_per_sample  # (B,)
     return loss_per_sample  # (B,)
+
+
+def physical_position_loss(pred, target, scaler_mean, scaler_std, pos_indices, mask, ref_dist):
+    """
+    全步物理空间位置误差损失（方向3：损失口径对齐，2026-09-11 新增）。
+
+    计算预测与真值在**原始物理空间**的位置 3D 距离（km），按参考距离归一化。
+    与 `multi_step_terminal_loss` 的区别：本项覆盖**全部 10 步**（后者只覆盖 t=3/6/9 与末步）。
+
+    动机：评估指标为物理空间位置 RMSE，而 `l_pred` 是标准化空间 Huber 损失；
+    标准化按各维 std 缩放（位置 std≈50 km、速度 std≈0.05 km/s），使速度误差在损失中
+    被显著放大，与评估口径不一致。本项使优化目标与评估指标对齐。
+
+    步长权重从 0.2 线性升至 1.0 —— 误差随预测步长增长（实测 0.76 km → 2.04 km），
+    后期步更需监督。
+
+    Args:
+        pred, target: (B, 10, max_dim) 标准化空间
+        scaler_mean/std: (max_dim,) numpy → tensor
+        pos_indices: 位置维度索引（12 个）
+        mask: (B, max_dim) bool
+        ref_dist: 归一化参考距离 (km)
+    Returns:
+        标量损失（无量纲）
+    """
+    B = pred.shape[0]
+    eps = 1e-8
+    pm = scaler_mean[pos_indices].to(pred.device)
+    ps = scaler_std[pos_indices].to(pred.device)
+
+    # 反归一化到 km，并重组为 (B, 10, max_N, 3)
+    pp = (pred[:, :, pos_indices] * (ps + eps) + pm).reshape(B, OUTPUT_STEPS, MAX_N, 3)
+    pt = (target[:, :, pos_indices] * (ps + eps) + pm).reshape(B, OUTPUT_STEPS, MAX_N, 3)
+
+    d = torch.norm(pp - pt, dim=-1)                     # (B, 10, max_N)  km
+
+    # 步长权重 0.2 → 1.0（后期步权重更高）
+    w = torch.linspace(0.2, 1.0, OUTPUT_STEPS, device=pred.device).view(1, -1, 1)
+
+    valid = mask[:, pos_indices].reshape(B, MAX_N, 3).any(dim=-1).float()  # (B, max_N)
+    vm = valid.unsqueeze(1)                             # (B, 1, max_N)
+
+    num = (d * w * vm).sum()
+    den = (w * vm).sum().clamp(min=1)
+    return num / den / ref_dist
 
 
 def multi_step_terminal_loss(pred, target, scaler_mean, scaler_std, pos_indices, mask):
@@ -129,6 +177,7 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
     total_l_physics = 0.0
     total_l_mode = 0.0
     total_l_terminal = 0.0
+    total_l_pos = 0.0
     total_l_bound = 0.0
     total_cw_input = 0.0
     total_cw_pred = 0.0
@@ -163,6 +212,12 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
     )
     use_terminal_loss = lambda_terminal > 0
 
+    # 全步位置损失权重（方向3：损失口径对齐）
+    lambda_pos = get_physics_weight(
+        epoch, POS_LOSS_WARMUP_EPOCHS,
+        POS_LOSS_WEIGHT, POS_LOSS_WEIGHT_FINAL
+    )
+
     # 将 scaler 参数缓存为 tensor（若尚未缓存且需要末端损失）
     _terminal_mean = None
     _terminal_std = None
@@ -170,13 +225,18 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
         _terminal_mean = torch.from_numpy(scaler.mean.astype('float32')).to(device)
         _terminal_std = torch.from_numpy(scaler.std.astype('float32')).to(device)
 
+    # 数据增强噪声强度（随 epoch 线性衰减到 0：前期抗过拟合，后期纯数据精调）
+    # 注：噪声在 model.forward 内部施加于 LSTM 输入分支，Δv 估计始终用干净输入
+    noise_std = (AUGMENT_NOISE_STD * max(0.0, 1.0 - epoch / max(1, AUGMENT_DECAY_EPOCHS))
+                 if AUGMENT_ENABLED else 0.0)
+
     for x, y, mask in loader:
         x, y, mask = x.to(device), y.to(device), mask.to(device)
         optimizer.zero_grad()
 
         if PHYSICS_ENABLED:
             pred, dv_all = model(x, target=y, teacher_forcing_ratio=tf_ratio,
-                                 return_dv=True, mask=mask)
+                                 return_dv=True, mask=mask, augment_std=noise_std)
         else:
             pred = model(x, target=y, teacher_forcing_ratio=tf_ratio)
             dv_all = None
@@ -219,6 +279,13 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
             loss = loss + 0.5 * lambda_terminal * l_terminal_multi
             total_l_terminal += l_terminal_multi.item()
 
+        # 全步物理空间位置损失（方向3：使优化目标与"物理空间位置 RMSE"评估口径对齐）
+        if lambda_pos > 0 and _term_mean_local is not None:
+            l_pos = physical_position_loss(pred, y, _term_mean_local, _term_std_local,
+                                           pos_indices, mask, POS_LOSS_REF_DIST)
+            loss = loss + lambda_pos * l_pos
+            total_l_pos += l_pos.item()
+
         # dv_alignment loss (内联，避免在 physics_loss_fn 中重复 forward)
         l_dv_align = torch.tensor(0.0, device=pred.device)
         if use_physics and dv_all is not None and lambda_mode > 0:
@@ -229,7 +296,9 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
             max_N = Dv // 3
             dm = dv_model_seq.reshape(Bv, Tv, max_N, 3)
             dc = dv_cw_input.reshape(Bv, Tv, max_N, 3)
-            diff = (dm - dc).pow(2)  # (B, T, max_N, 3)
+            # 按 Δv 上限归一化（无量纲），与 physics_loss.dv_alignment_loss 口径一致
+            _dv_ref = DELTAV_LIMIT / 1000.0
+            diff = ((dm - dc) / _dv_ref).pow(2)  # (B, T, max_N, 3)
             agent_mse = diff.mean(dim=(1, 3))  # (B, max_N)
             valid = mask.reshape(Bv, max_N, 6).any(dim=-1).float()
             l_dv_align = (agent_mse * valid).sum() / valid.sum().clamp(min=1)
@@ -238,7 +307,8 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
 
         # 物理损失（CW 残差 + Δv 边界）
         if use_physics and dv_all is not None and (lambda_physics > 0 or lambda_bound > 0):
-            # dv_all 结构: [9 步 CW 估计, 10 步模型预测] -> (B, 19, max_N*3)
+            # dv_all 结构: [9 步 CW 逆推 Δv, 9 步模型速度差分] -> (B, 18, max_N*3)
+            #   注: dv_all[:, :9] = CW 逆推；dv_all[:, 9:18] = 模型预测轨迹的速度差分
             phys_losses = physics_loss_fn(
                 pred_states=pred,
                 target_states=y,
@@ -329,6 +399,9 @@ def train_epoch(model, loader, optimizer, device, epoch, total_epochs,
         "lambda_m": lambda_mode,
         "lambda_t": lambda_terminal,
         "lambda_b": lambda_bound,
+        "lambda_pos": lambda_pos,
+        "pos": total_l_pos / n_batches,
+        "noise_std": noise_std,
     }
     return loss_info
 
@@ -374,7 +447,9 @@ def validate(model, loader, device, physics_loss_fn=None, scaler=None):
             max_N = Dv // 3
             dm = dv_model_seq.reshape(Bv, Tv, max_N, 3)
             dc = dv_cw_input.reshape(Bv, Tv, max_N, 3)
-            diff = (dm - dc).pow(2)
+            # 按 Δv 上限归一化（同 train_epoch，保持训练/验证口径一致）
+            _dv_ref = DELTAV_LIMIT / 1000.0
+            diff = ((dm - dc) / _dv_ref).pow(2)
             agent_mse = diff.mean(dim=(1, 3))
             valid = mask.reshape(Bv, max_N, 6).any(dim=-1).float()
             l_dv_align = (agent_mse * valid).sum() / valid.sum().clamp(min=1)
@@ -507,6 +582,23 @@ def load_pretrained_encoder(model, checkpoint_path, device):
 
 
 def train():
+    # ── 随机种子（2026-09-11）──
+    # 数据划分由 load_and_split 内部固定的 RANDOM_SEED 决定（不受此处影响），
+    # 故本种子只影响**模型初始化与 dropout 采样**，从而保证
+    # 「同一数据划分、不同初始权重」—— 这正是集成所需多样性的正确来源。
+    if SEED > 0:
+        import random as _random
+        _random.seed(SEED)
+        np.random.seed(SEED)
+        torch.manual_seed(SEED)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(SEED)
+        print(f"[seed] 已固定随机种子 SEED={SEED}")
+    else:
+        print("[seed] SEED=0，使用随机初始化（每次训练不同）")
+    if RUN_TAG:
+        print(f"[tag] RUN_TAG={RUN_TAG}，产物将带此后缀")
+
     # ── 加载数据 ──
     print("=" * 60)
     print("加载数据...")
@@ -526,7 +618,8 @@ def train():
 
     # ── 创建模型 ──
     print(f"\n使用设备: {DEVICE}")
-    model = create_model(DEVICE)
+    # 传入 scaler：PI-LSTM 需将标准化输入还原到物理空间才能正确估计 Δv
+    model = create_model(DEVICE, scaler)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"模型类型: {'物理信息条件 LSTM' if PHYSICS_ENABLED else '标准 LSTM'}")
     print(f"可训练参数量: {total_params:,}")
@@ -568,7 +661,23 @@ def train():
 
         if ckpt_path is not None:
             checkpoint = torch.load(ckpt_path, map_location=DEVICE)
-            model.load_state_dict(checkpoint["model_state_dict"])
+            ckpt_state = checkpoint["model_state_dict"]
+            model_keys = set(model.state_dict().keys())
+            missing = sorted(model_keys - set(ckpt_state.keys()))
+            if missing:
+                # ⚠️ 2026-09-10：不再静默崩溃。架构不匹配时必须明确报错并给出可执行修复方案，
+                # 否则会退回随机初始化（或直接抛 RuntimeError），两种情况都难以定位。
+                raise RuntimeError(
+                    f"\n检查点与当前模型架构不匹配：缺失 {len(missing)}/{len(model_keys)} 个参数。\n"
+                    f"  检查点 : {ckpt_path}\n"
+                    f"  缺失示例: {missing[:5]}\n"
+                    f"  常见原因: 切换了 USE_TRANSFORMER / PHYSICS_ENABLED，或检查点来自其他架构。\n"
+                    f"  修复方法: 删除或移走以下文件后重新训练，或设 config.RESUME_TRAINING=False\n"
+                    f"            {CHECKPOINT_SAVE_PATH}\n"
+                    f"            {MODEL_SAVE_PATH}"
+                )
+            # strict=False：容忍检查点中多余的键（例如已改为非持久化的派生 buffer）
+            model.load_state_dict(ckpt_state, strict=False)
             # optimizer_state_dict 可能在重置后缺失（新损失场景），此时保持新优化器
             if "optimizer_state_dict" in checkpoint:
                 optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
@@ -644,9 +753,11 @@ def train():
     if train_history is None:
         train_history = {
             "total": [], "pred": [], "physics": [], "mode": [], "terminal": [], "bound": [],
+            "pos": [],
             "cw_input": [], "cw_pred": [], "dv_change": [], "dv_align": [],
             "grad_norm": [],
             "tf_ratio": [], "lambda_p": [], "lambda_m": [], "lambda_t": [], "lambda_b": [],
+            "lambda_pos": [],
             "lr": [], "time": [],
         }
     if val_history is None:
@@ -701,13 +812,15 @@ def train():
                 f"Epoch {epoch:3d}/{EPOCHS} | "
                 f"Train: {train_info['total']:.6f} (pred={train_info['pred']:.6f} "
                 f"phy={train_info['physics']:.6f} term={train_info['terminal']:.6f} "
-                f"mode={train_info['mode']:.6f} bound={train_info.get('bound', 0.0):.6f}) | "
+                f"mode={train_info['mode']:.6f} bound={train_info.get('bound', 0.0):.6f} "
+                f"pos={train_info.get('pos', 0.0):.6f}) | "
                 f"Val: {val_info['total']:.6f} (pred={val_info['pred']:.6f} "
                 f"phy={val_info['physics']:.6f} dvalign={val_info.get('dv_align', 0.0):.6f}) | "
                 f"td={val_info.get('terminal_dist_mean', 0.0):.3f}km | "
                 f"TF: {train_info['tf_ratio']:.2f} | "
                 f"λ_p={train_info['lambda_p']:.3f} λ_m={train_info['lambda_m']:.3f} "
-                f"λ_t={train_info['lambda_t']:.3f} λ_b={train_info.get('lambda_b', 0.0):.3f} | "
+                f"λ_t={train_info['lambda_t']:.3f} λ_b={train_info.get('lambda_b', 0.0):.3f} "
+                f"λ_pos={train_info.get('lambda_pos', 0.0):.3f} | "
                 f"LR: {current_lr:.2e} | "
                 f"Time: {elapsed:.1f}s"
             )
@@ -762,7 +875,7 @@ def train():
     log_file.close()
 
     # ── 保存训练历史为 .mat ──
-    mat_path = os.path.join(OUTPUT_DIR, "training_history.mat")
+    mat_path = os.path.join(OUTPUT_DIR, f"training_history{('_' + RUN_TAG) if RUN_TAG else ''}.mat")
     try:
         mat_data = {
             # 基本迭代信息

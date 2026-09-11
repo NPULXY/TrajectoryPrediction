@@ -11,6 +11,8 @@ import math
 import torch
 import torch.nn as nn
 
+from config import CW_DT_H
+
 
 # ==================== 轨道物理常数 ====================
 MU = 398600.0               # 地球引力常数 (km³/s²)
@@ -110,7 +112,7 @@ class PhysicsLoss(nn.Module):
         self,
         scaler=None,
         n=N_MEAN,
-        dt_h=1.0,
+        dt_h=CW_DT_H,
         delta_v_limit=3.0,   # m/s
         device="cpu",
     ):
@@ -210,18 +212,29 @@ class PhysicsLoss(nn.Module):
 
     def _velocity_change_loss(self, states, mask):
         """
-        Δv 边界软约束（原始量纲 km/s）。
-        当 ‖Δv‖ > 3/1000 km/s 时惩罚。
+        脉冲 Δv 边界软约束（原始量纲 km/s）。
+
+        ⚠️ 2026-09-10 修正：原实现直接对相邻步速度差分 ‖v_{t+1} − v_t‖ 施加约束，
+        但数据真实步长为 60 s，该差分中包含 CW 自由演化带来的速度变化
+        （量级约 4 m/s），即使无机动也会远超 3 m/s 上限，导致惩罚恒为正、约束失效。
+
+        正确做法是扣除自由演化后取**脉冲增量**：
+            Δv_pulse = v_{t+1} − [Φ_h · x_t]_vel
+        这才是真正由机动引入的速度增量。
         """
         B, T, D = states.shape
         max_N = D // 6
         limit = self.delta_v_limit
+        Phi = self.Phi_h.to(states.device)
 
         s = states.reshape(B, T, max_N, 6)
-        vel = s[..., 3:6]  # (B, T, max_N, 3)
-        dv = vel[:, 1:] - vel[:, :-1]  # (B, T-1, max_N, 3)
-        dv_abs = torch.norm(dv, dim=-1)  # (B, T-1, max_N)
-        over = torch.relu(dv_abs - limit)  # (B, T-1, max_N)
+        s_free = s[:, :-1] @ Phi.T                      # (B, T-1, max_N, 6)
+        dv_pulse = s[:, 1:, :, 3:6] - s_free[..., 3:6]  # (B, T-1, max_N, 3)
+        # 归一化超限量：relu(‖Δv‖/limit − 1)，无量纲。
+        # ⚠️ 2026-09-10 两次校准：原 km/s 直接作差平方量级仅 1e-7（约束失效）；
+        # 改用 m/s 又放大到 1e4（主导梯度）。归一化后「超限 1 倍」对应损失 1.0。
+        dv_abs = torch.norm(dv_pulse, dim=-1)               # (B, T-1, max_N)，km/s
+        over = torch.relu(dv_abs / limit - 1.0)             # (B, T-1, max_N)
 
         agent_penalty = over.pow(2).mean(dim=1)  # (B, max_N)
         valid = mask.reshape(B, max_N, 6).any(dim=-1).float()
@@ -252,8 +265,14 @@ class PhysicsLoss(nn.Module):
         m = dv_model[:, :T].reshape(B, T, max_N, 3)
         c = dv_cw[:, :T].reshape(B, T, max_N, 3)
 
-        # MSE 损失
-        diff = (m - c).pow(2)  # (B, T, max_N, 3)
+        # MSE 损失（按 Δv 上限归一化，化为无量纲）
+        # ⚠️ 2026-09-10 两次校准：
+        #   - 原始 km/s 直接平方 -> 量级 1e-5，被预测损失完全淹没（约束失效）；
+        #   - 改用 m/s 平方   -> 量级 1e3~1e4，又反过来主导梯度（易诱发发散）。
+        #   最终采用「除以 Δv 上限」的归一化形式：偏差达到 1 倍上限时损失为 1.0，
+        #   与 λ_m 的量级设计相匹配。
+        ref = max(self.delta_v_limit, 1e-9)          # km/s
+        diff = ((m - c) / ref).pow(2)                # (B, T, max_N, 3)，无量纲
         agent_mse = diff.mean(dim=(1, 3))  # (B, max_N)
 
         # 仅有效 agent 参与平均
@@ -272,8 +291,8 @@ class PhysicsLoss(nn.Module):
             input_states:  (B, 10, max_dim) 输入序列 (标准化)
             mask:          (B, max_dim) bool
             compute_all:   是否计算所有子损失（用于 warmup）
-            dv_model:      (B, 19, max_N*3) 模型预测的 Δv 序列（可选）
-            dv_cw:         (B, 19, max_N*3) CW 逆推的 Δv 序列（可选）
+            dv_model:      (B, 18, max_N*3) 模型预测的 Δv 序列（可选；实际有效为前 9 步）
+            dv_cw:         (B, 18, max_N*3) CW 逆推的 Δv 序列（可选；实际有效为前 9 步）
 
         Returns:
             dict: {

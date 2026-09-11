@@ -31,7 +31,8 @@ from matplotlib.gridspec import GridSpec
 
 from config import (
     DATA_DIR, OUTPUT_DIR, MODEL_SAVE_PATH, SCALER_SAVE_PATH,
-    DEVICE, MAX_DIM, INPUT_STEPS, OUTPUT_STEPS, PHYSICS_ENABLED,
+    DEVICE, MAX_DIM, INPUT_STEPS, OUTPUT_STEPS, PHYSICS_ENABLED, CW_DT_H,
+    ENSEMBLE_MODELS,
 )
 from utils.data_loader import FeatureScaler, parse_csv
 from models.model import create_model
@@ -75,8 +76,9 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    time_known = np.arange(1, INPUT_STEPS + 1) * 60                       # 60, 120, ..., 600 s
-    time_future = np.arange(INPUT_STEPS + 1, INPUT_STEPS + OUTPUT_STEPS + 1) * 60  # 660, ..., 1200 s
+    # 时间轴（步长取实测值 CW_DT_H = 60 s，2026-09-10 修正为引用常量）
+    time_known = np.arange(1, INPUT_STEPS + 1) * CW_DT_H
+    time_future = np.arange(INPUT_STEPS + 1, INPUT_STEPS + OUTPUT_STEPS + 1) * CW_DT_H
 
     for rank, sample_idx in enumerate(top_indices, 1):
         dist_val = dist_array[sample_idx]
@@ -156,7 +158,7 @@ def visualize_best_predictions(X_raw, preds_raw, gt_raw, masks,
                         color=color, linestyle="--", linewidth=3)
 
                 # Divider between known and future
-                ax.axvline(x=630, color="gray", linestyle=":",
+                ax.axvline(x=CW_DT_H * (INPUT_STEPS + 0.5), color="gray", linestyle=":",
                            alpha=0.5, linewidth=0.8)
 
                 ax.set_ylabel(f"${axis_label}$ (km)")
@@ -247,20 +249,41 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
     scaler.load(scaler_path)
     print(f"Scaler 已加载: {scaler_path}")
 
-    # ── 加载模型 ──
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"模型文件不存在: {model_path}")
-    model = create_model(DEVICE)
-    checkpoint = torch.load(model_path, map_location=DEVICE)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model.eval()
-    model_type = checkpoint.get("model_type", "lstm")
-    term_dist_info = ""
-    if "val_terminal_dist" in checkpoint:
-        term_dist = checkpoint["val_terminal_dist"]
-        term_dist_info = f", terminal_dist={term_dist:.4f} km"
-    print(f"模型已加载: {model_path} (epoch {checkpoint['epoch']}, "
-          f"val_loss={checkpoint['val_loss']:.6f}{term_dist_info}, type={model_type})")
+    # ── 加载模型（支持多模型集成，2026-09-11）──
+    ensemble_members = None
+    if ENSEMBLE_MODELS:
+        from utils.ensemble import load_members
+        print(f"\n集成模式：加载 {len(ENSEMBLE_MODELS)} 个成员")
+        ensemble_members = load_members(ENSEMBLE_MODELS, scaler, DEVICE)
+        if not ensemble_members:
+            raise RuntimeError("集成成员全部加载失败，请检查 ENSEMBLE_MODELS 配置。")
+        print(f"集成成员加载完成：{len(ensemble_members)} 个 "
+              f"（预测将在标准化空间等权平均）")
+        model_type = "ensemble"
+    else:
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"模型文件不存在: {model_path}")
+        model = create_model(DEVICE, scaler)
+        checkpoint = torch.load(model_path, map_location=DEVICE)
+        ckpt_state = checkpoint["model_state_dict"]
+        model_keys = set(model.state_dict().keys())
+        missing = sorted(model_keys - set(ckpt_state.keys()))
+        if missing:
+            raise RuntimeError(
+                f"模型权重与当前架构不匹配：缺失 {len(missing)}/{len(model_keys)} 个参数"
+                f"（示例 {missing[:5]}）。请确认 config.py 中 PHYSICS_ENABLED / USE_TRANSFORMER "
+                f"与该权重来源一致。"
+            )
+        # strict=False：容忍旧 checkpoint 中多余的键（如已改为非持久化的派生 buffer）
+        model.load_state_dict(ckpt_state, strict=False)
+        model.eval()
+        model_type = checkpoint.get("model_type", "lstm")
+        term_dist_info = ""
+        if "val_terminal_dist" in checkpoint:
+            term_dist = checkpoint["val_terminal_dist"]
+            term_dist_info = f", terminal_dist={term_dist:.4f} km"
+        print(f"模型已加载: {model_path} (epoch {checkpoint['epoch']}, "
+              f"val_loss={checkpoint['val_loss']:.6f}{term_dist_info}, type={model_type})")
 
     # ── 读取并解析输入数据 ──
     samples, masks = parse_csv(input_path)
@@ -271,6 +294,7 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
     X_norm = scaler.transform(X_raw)
     X_tensor = torch.from_numpy(X_norm).float().to(DEVICE)
     masks_np = np.stack(masks, axis=0)       # (N, 24)
+    masks_tensor = torch.from_numpy(masks_np).bool().to(DEVICE)
 
     # ── 分批推理 ──
     batch_size = 256
@@ -279,9 +303,16 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
     with torch.no_grad():
         for i in range(0, n_samples, batch_size):
             batch = X_tensor[i:i + batch_size]
+            batch_mask = masks_tensor[i:i + batch_size]
 
-            if PHYSICS_ENABLED:
-                pred, _ = model(batch, return_dv=True)
+            if ensemble_members is not None:
+                from utils.ensemble import predict_batch
+                pred = predict_batch(ensemble_members, batch, batch_mask)
+            elif PHYSICS_ENABLED:
+                # ⚠️ 2026-09-10 修正：原先漏传 mask，导致 forward 内 mask 默认为全 True，
+                # dv_global 被除以 max_N(=4) 而非实际 N，条件向量与训练/验证口径不一致
+                # （实测 N=2 样本位置偏差平均 0.271 km、最大 2.422 km）。
+                pred, _ = model(batch, return_dv=True, mask=batch_mask)
             else:
                 pred = model(batch)
 
@@ -353,13 +384,22 @@ def predict(input_path, output_path, model_path=MODEL_SAVE_PATH,
         top_indices = top_indices[final_order]
 
         vis_dir = os.path.join(OUTPUT_DIR, "best_predictions")
-        # 清空已有 SVG/MAT/PNG 文件，保留其他文件（如 .m 脚本）
-        if os.path.exists(vis_dir):
-            for fname in os.listdir(vis_dir):
-                if fname.lower().endswith(('.png', '.mat', '.png')):
+        os.makedirs(vis_dir, exist_ok=True)
+        # 清空历史图（.png/.mat/.svg）。
+        # ⚠️ 2026-09-10 修正：原实现为 endswith(('.png','.mat','.png'))——'.png' 重复、漏掉 .svg，
+        # 导致旧 SVG 永久累积；且 os.remove 无容错，在受限（走回收站）环境中会直接崩溃。
+        removed, failed = 0, 0
+        for fname in os.listdir(vis_dir):
+            if fname.lower().endswith((".png", ".mat", ".svg")):
+                try:
                     os.remove(os.path.join(vis_dir, fname))
-        else:
-            os.makedirs(vis_dir, exist_ok=True)
+                    removed += 1
+                except OSError:
+                    failed += 1
+        if failed:
+            print(f"  注意: {failed} 个历史文件无法删除（可能被占用），将直接覆盖同名文件")
+        if removed:
+            print(f"  已清理 {removed} 个历史图")
 
         print(f"\n生成最佳预测可视化图，保存至: {vis_dir}")
         visualize_best_predictions(
