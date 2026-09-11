@@ -41,16 +41,18 @@ TrajectoryPrediction/
 ├── Dataset_Summary/             # 汇总数据集（217,642 样本，主用）
 ├── Dataset_new2/                # 交会场景子集（23,787 样本）
 ├── output/                      # 训练与评估产物（核心产物在顶层）
-│   ├── best_model.pth / latest_checkpoint.pth / scaler.pkl
-│   ├── train_log.txt / training_history.mat / X_pred.csv
+│   ├── best_model*.pth          #   各配置最优权重（p1 / f1 / f2 / h512 / e1 / e2）
+│   ├── scaler.pkl / ensemble_config.json
+│   ├── train_log*.txt / training_history.mat / X_pred.csv
 │   ├── loss_curve / cw_residual / dv_distribution / sample_*   # 图表（各附 .mat）
 │   ├── best_predictions/        #   最佳预测样本图（按 N 分层采样）
 │   ├── _logs/                   #   历史运行日志归档
 │   └── _archive/                #   旧图表 / 旧样本 / 废弃集成结果
 ├── _tools/                      # 诊断与对比工具（见 _tools/README.md）
 ├── _experiments/                # 消融实验脚本归档（见 _experiments/README.md）
-├── _archive/                    # 历史权重、旧备份、.bak、v6 体系快照
-│   └── v6_core/                 #   ★ v6 体系精简备份（代码 + 关键权重 + 说明）
+├── _archive/                    # 历史权重、旧备份、.bak、版本快照
+│   ├── v6_core/                 #   v6 体系精简备份（代码 + 关键权重 + 说明）
+│   └── best_v1_2026-09-11/      #   ★ 当前最优版本备份（集成成员 + scaler + 代码快照 + 校验和）
 ├── _docs/                       # 历史提示词存档与参考文献
 └── _rendered/                   # 渲染产物
 ```
@@ -85,14 +87,31 @@ python train.py
 → 构建模型 → Cosine warmup + annealing 调度 → 以 `val_terminal_dist_mean` 为判据早停
 → 保存 `output/best_model.pth` / `latest_checkpoint.pth` / `scaler.pkl` / `training_history.mat`。
 
+**并行训练与消融（2026-09-11 新增环境变量）**——产物自动加后缀，互不干扰：
+
+| 变量 | 作用 | 示例 |
+|------|------|------|
+| `TP_RUN_TAG` | 产物文件名后缀 | `TP_RUN_TAG=f1` → `best_model_f1.pth` |
+| `TP_SEED` | 模型初始化种子（0=随机） | `TP_SEED=301` |
+| `TP_HIDDEN` / `TP_LAYERS` | PI-LSTM 容量覆盖 | `TP_HIDDEN=512` |
+| `TP_POS_W` | 位置损失权重 `λ_pos` | `TP_POS_W=0.5` |
+| `TP_ENSEMBLE` | 集成成员路径（逗号分隔） | 见下方推理 |
+
+复现当前最优成员：
+```bash
+TP_RUN_TAG=p1 TP_POS_W=0.5 python train.py
+TP_RUN_TAG=f1 TP_HIDDEN=512 TP_POS_W=0.5 TP_SEED=301 python train.py
+TP_RUN_TAG=f2 TP_HIDDEN=512 TP_POS_W=0.5 TP_SEED=302 python train.py
+```
+
 ### 评估
 
 ```bash
 python evaluate.py
 ```
 
-输出整体与分位置/速度的 MSE、RMSE、MAE，物理一致性指标（CW 残差、Δv 幅值分布），并生成
-`loss_curve.png`、`cw_residual.png`、`dv_distribution.png`、`sample_*.png`（均附同名 `.mat`）。
+输出整体与分位置/速度的 MSE、RMSE、MAE，物理一致性指标（CW 位置/速度残差、**脉冲 Δv** 幅值分布），
+并生成 `loss_curve.png`（三子图）、`cw_residual.png`、`dv_distribution.png`、`sample_*.png`（均附同名 `.mat`）。
 
 ### 推理
 
@@ -102,6 +121,12 @@ python predict.py --no-visualize       # 仅推理
 python predict.py --top-k 30           # 可视化数量（N=2/3/4 各 10 个）
 python predict.py --input in.csv --output out.csv
 ```
+
+**集成推理**（推荐，位置 RMSE +7.66%；成员容量可不同，自动推断架构）：
+```bash
+TP_ENSEMBLE="output/best_model_p1.pth,output/best_model_f1.pth,output/best_model_f2.pth" python predict.py
+```
+未设置 `TP_ENSEMBLE` 时走单模型模式（`MODEL_SAVE_PATH`），行为与原先一致。
 
 ---
 
@@ -138,28 +163,35 @@ python predict.py --input in.csv --output out.csv
 
 ## 损失函数
 
-$$\mathcal{L} = w_{s}\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term}^{multi} + \lambda_t \mathcal{L}_{term}^{last} + \lambda_m \mathcal{L}_{align} + \lambda_p \mathcal{L}_{cw} + \lambda_b \mathcal{L}_{bound}$$
+$$\mathcal{L} = w_{s}\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term}^{multi} + \lambda_t \mathcal{L}_{term}^{last} + \lambda_{pos}\mathcal{L}_{pos} + \lambda_m \mathcal{L}_{align} + \lambda_p \mathcal{L}_{cw} + \lambda_b \mathcal{L}_{bound}$$
 
 | 分量 | 含义 | 权重（初始 → 终值） | warmup |
 |------|------|-------------------|--------|
 | `L_Huber` | 逐样本 Huber（δ=1.0），**末端距离大的样本降权**（>10 km → 0.1，5–10 km → 0.3） | 1.0 | — |
 | `L_term^multi` | t=3/6/9 的 3D 距离，阶梯权重 0.3/0.5/1.0，除以 `TERMINAL_REF_DIST=4.5` | 0.01 → 2.0 | 15 ep |
 | `L_term^last` | 末步 3D 距离，同样归一化 | 同上 | 15 ep |
-| `L_align` | 模型预测 Δv 与 CW 逆推 Δv 的对齐（PI-LSTM 核心约束） | 0.001 → 0.05 | 20 ep |
+| **`L_pos`** | **物理空间全 10 步 3D 位置误差**，**步长权重 0.2→1.0**，除以 `POS_LOSS_REF_DIST=4.5` | **0.0 → 0.5**（`TP_POS_W`） | 15 ep |
+| `L_align` | 模型预测 Δv 与 CW 逆推 Δv 的对齐（PI-LSTM 核心约束），**按 Δv 上限归一化** | 0.001 → 0.05 | 20 ep |
 | `L_cw` | CW 单步递推残差（分维度归一化） | 0.0 → **0.05**（步长修正后重新启用） | 20 ep |
-| `L_bound` | Δv 边界软约束（超出 3 m/s 惩罚，原始量纲） | 0.0005 → 0.005 | 15 ep |
+| `L_bound` | 脉冲 Δv 边界软约束（**归一化超限量** `relu(‖Δv‖/limit − 1)`） | 0.0005 → 0.005 | 15 ep |
 
 前 `PRED_WARMUP_EPOCHS=3` 轮仅使用 `L_Huber`。
+
+**关于 `L_pos`（2026-09-11 新增，方向 3，增益 +4.50%）**：评估指标是**物理空间位置 RMSE (km)**，
+而 `L_Huber` 在**标准化空间**计算。标准化按各维 std 缩放（位置 std≈50 km、速度 std≈0.05 km/s），
+使速度误差在损失中被显著放大，**优化目标与评估口径不一致**。`L_pos` 直接监督全 10 步的物理空间
+3D 位置误差（步长权重递增，因误差随预测步长增长：实测 0.76 → 2.04 km），使二者对齐。
+这是本项目**最大的单项精度提升**。
 
 **关于 `TERMINAL_REF_DIST=4.5`（改进 C）**：末端距离损失原本在物理量纲直接计算（量级 ~4.0 km），
 与标准化空间的 `L_Huber`（~0.008）相差约 500×，乘以 λ_t=2.0 后以约 1500× 优势主导梯度，
 导致引入数据增强后 loss 爆炸（0.02 → 9.9）。归一化后量级降至 ~1.0，梯度分配恢复均衡，
 完整 80 epoch 训练不再发散。
 
-**关于 `L_cw`（2026-09-10 修正）**：原先其权重被设为 1e-7（等同关闭），理由是"数据步长与
-`Φ_h(1s)` 假设不符"。但实测判定表明**真实步长是 60 s**（依据见下），该理由不成立。
-将 `CW_DT_H` 修正为 60 s 后，CW 残差量级下降约两个数量级，故**重新启用**物理约束（终值权重 0.05）。
-修正后 CW 逆推的脉冲 Δv 均值约 3.5 m/s，与数据集动作幅值设计值 3 m/s 吻合，佐证步长判定的正确性。
+**关于 `L_cw` 与 `L_align`/`L_bound` 的尺度校准（2026-09-10/11）**：三者均曾因尺度失衡而失效——
+`L_align` 在 km/s 下平方后仅 1e-5（被预测损失淹没），改用 m/s 又达 4431（主导梯度），
+最终统一采用**按 Δv 上限归一化的无量纲形式**。判据：修正后 CW 逆推脉冲 Δv 均值 **3.52 m/s**，
+与数据集动作幅值设计值 3 m/s 吻合；且 `L_align` **单调下降**（语义错误时恒定 0.843 不降）。
 
 ---
 
@@ -262,45 +294,60 @@ $$\mathcal{L} = w_{s}\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{te
 |---------|------|------|
 | v4 | LSTM Encoder-Decoder + Delta 残差 + Teacher forcing | 验证 loss 0.017，效果良好 |
 | v5 | Transformer-PI（自注意力替代 LSTM） | **劣化 27%**，早停（td 5.4947 km） |
-| **v6** | **多场景汇总数据集 + 断点恢复 + 学术风格可视化**（架构仍是 v3 PI-LSTM） | **当前主线** |
+| **v6** | **多场景汇总数据集 + 断点恢复 + 学术风格可视化**（架构仍是 v3 PI-LSTM） | 主线配置 |
 | v7 | CW baseline 残差学习 / 变容量 v7a(256) v7b(320) | v7a 仅 td 5.2040 km，失败 |
 | v8 | 知识蒸馏（v6 teacher → v7 student） | 未产出可用权重 |
 | v9 | 输入高斯噪声数据增强 | loss 爆炸早停 |
 | v10 | hidden=512 + 物理一致增强 | 早停于 ep1（td 4.7567 km） |
 | v11 | 3-seed bagging | 早停于 ep1（td 4.7243 km） |
+| **v12** | **物理计算修正（步长/量纲/语义/尺度）+ 位置损失对齐 + 容量可配置 + 集成** | **当前最优（+7.66%）** |
 
-**v7~v11 的共同失败原因**：末端距离损失量级失衡导致 loss 爆炸，**已由改进 C 修复**，
-因此这些实验在原理上可基于当前主线重试（脚本见 `_experiments/`）。
+> **v7~v11 的失败原因已查明**：末端距离损失量级失衡导致 loss 爆炸（**已由改进 C 修复**），
+> 且 **CW 锚定路线本身不可行** —— 追踪星持续机动，CW 外推基线位置 RMSE 达 120.87 km，
+> 比持久基线（17.66 km）还差 6.8 倍。故 v7 残差学习不宜重试。
 
-**当前最优（统一验证集口径）**：
+**当前最优（测试集 32,647 样本，原始物理量纲）**：
 
-| 策略 | td_max | 位置 RMSE |
-|------|-------:|----------:|
-| v6 与 v6o 等权集成 | **4.2400 km** | **1.3100 km** |
-| v6o 单独 | 4.2936 km | 1.3478 km |
-| v6 单独 | 4.3171 km | 1.3227 km |
+| 策略 | 位置 RMSE | 位置 MAE | 末端距离 |
+|------|----------:|---------:|---------:|
+| 原始基线（384 容量） | 1.3707 km | 0.9423 km | 4.2780 km |
+| 最优单模型 `best_model_f1`（512 + 位置损失） | 1.2958 km | 0.8620 km | 4.2461 km |
+| **集成 `p1 + f1 + f2`（推荐）** | **1.2657 km** | **0.8434 km** | **4.1659 km** |
+| **累计增益** | **+7.66%** | **+10.50%** | **+2.62%** |
 
-即**集成优于最优单模型约 1.25%**；集成需同时加载两个模型，而 `predict.py` / `evaluate.py`
-目前仅支持单模型，启用需先改造。
+**启用集成**（`predict.py` 已支持，配置见 `output/ensemble_config.json`）：
+```bash
+TP_ENSEMBLE="output/best_model_p1.pth,output/best_model_f1.pth,output/best_model_f2.pth" python predict.py
+```
+
+**增益归因**：位置损失口径对齐 **+4.50%**（最大单项）、增容量 512 +0.86%、
+集成再 +2.32%。三方向可叠加。选择流程为**验证集选组合 → 测试集报告**（无过拟合）。
 
 ---
 
 ## 已知问题
 
-1. **续训可能崩溃**：`train.py` 加载检查点处（`RESUME_TRAINING=True` 分支）**没有 try/except**。
-   若 `output/latest_checkpoint.pth` 残留了其他架构（如 v5 Transformer）的权重，
-   `load_state_dict(strict=True)` 会直接抛 `RuntimeError`。
-   **切换架构或权重来源后，请先清理该文件。**
-2. **`predict.py` 推理未传 mask**：`model(batch, return_dv=True)` 使 mask 默认全 True，
-   导致全局 Δv 被除以 `max_N=4` 而非实际 N。实测 N=2 样本位置偏差平均 0.271 km（最大 2.422 km），
-   N=3 平均 0.171 km，N=4 无偏差——即 **77% 的样本推理口径与验证不一致**。
-   （`evaluate.py` 传了 mask，是正确的。）
-3. **`best_val_loss` 恒为 inf**：`train()` 中该变量初始化后从未更新，故 `latest_checkpoint.pth`
+### ✅ 已修复（2026-09-10 / 09-11）
+
+| 问题 | 修复 |
+|------|------|
+| **续训崩溃**：`train.py` 加载检查点处无 try/except，架构不匹配直接抛 `RuntimeError` | 增加缺失键检测 + 带修复指引的明确报错；`strict=False` 容忍多余的派生 buffer |
+| **`predict.py` 推理未传 mask**：mask 默认全 True，全局 Δv 被除以 `max_N=4` 而非实际 N，实测 N=2 位置偏差最大 2.422 km（77% 样本口径与验证不一致） | 补 `mask=batch_mask` |
+| **`dv_all` 注释误写 19 步**（实为 18：9 CW + 9 速度差分） | 已修正 |
+| **`predict.py` 目录清理 bug**：`endswith` 中 `.png` 重复、漏 `.svg`，且 `os.remove` 无容错 | 后缀集合修正 + 逐文件 `try/except` |
+| **集成不支持**：`predict.py` / `evaluate.py` 仅支持单模型 | 新增 `utils/ensemble.py` + `ENSEMBLE_MODELS`（自动推断架构，支持混合容量） |
+
+### ⚠️ 仍存在
+
+1. **`best_val_loss` 恒为 inf**：`train()` 中该变量初始化后从未更新，故 `latest_checkpoint.pth`
    的 `val_loss` 字段不可用（应看 `val_terminal_dist` 或用 `_tools/inspect_checkpoints.py`）。
-4. **scheduler 跨 epoch 跳变**：`lr_lambda` 依赖 `total_epochs`，修改 `EPOCHS` 后续训会导致
+2. **scheduler 跨 epoch 跳变**：`lr_lambda` 依赖 `total_epochs`，修改 `EPOCHS` 后续训会导致
    学习率相位突变；`RESUME_FIXED_LR` 补丁会被下一轮 `scheduler.step()` 覆盖，尚未根治。
-5. **`dv_all` 为 18 步**（9 CW + 9 速度差分），代码注释中多处误写为 19。
-6. **`models/model.py` 与 `models/pinn_lstm.py` 各有一个 `create_model`**，训练实际使用前者的版本。
+3. **`models/model.py` 与 `models/pinn_lstm.py` 各有一个 `create_model`**，训练实际使用前者的版本
+   （后者是死代码）。
+4. **末端距离损失被计算两次**（`multi_step_terminal_loss` 与末步 loss 叠加），实际末端总权重 ≈1.5 λ_t。
+5. **环境限制**：`output/best_predictions/` 内删除超过 50 个文件会触发 safe-delete 策略阻断
+   （`SAFE_DELETE_BULK_CONFIRM_REQUIRED`）；重跑可视化前宜先用 `mv` 把旧目录整体移走。
 
 ---
 

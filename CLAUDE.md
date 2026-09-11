@@ -8,12 +8,15 @@
 给定追踪航天器相对目标的**过去 10 步**状态（位置 km + 速度 km/s，LVLH 坐标系），预测**未来 10 步**。
 数据集覆盖交会/阻扰/探测/潜伏/混合五场景，共 217,642 样本。
 
-**当前主线 = v6 体系**：
-- 架构：**PI-LSTM v3**（`models/pinn_lstm.py`，`PhysicsInformedTrajectoryLSTM`），可训练参数 4,915,176
+**当前主线 = v6 体系（2026-09-11 经物理修正与精度优化）**：
+- 架构：**PI-LSTM v3**（`models/pinn_lstm.py`，`PhysicsInformedTrajectoryLSTM`），
+  容量由 `PI_HIDDEN_SIZE`/`PI_NUM_LAYERS` 配置（默认 384/4，可训 512）
 - 配置：`config.py` 中 `PHYSICS_ENABLED=True`、`USE_TRANSFORMER=False`
-- 最新最优单模型：`output/best_model.pth`（epoch 80，val_terminal_dist **4.3171 km**）
-- 集成最优：`output/best_model.pth` 与 `_archive/v6_core/weights/best_model_v6o_ep80.pth` 等权平均
-  （td 4.2400 km，优于最优单模型 1.25%）
+- **最优单模型**：`output/best_model_f1.pth`（hidden 512 + 位置损失，测试集位置 RMSE **1.2958 km**）
+- **最优集成（推荐）**：`best_model_p1` + `best_model_f1` + `best_model_f2` 等权
+  （测试集位置 RMSE **1.2657 km**，相对原始基线 1.3707 km **+7.66%**）
+  配置见 `output/ensemble_config.json`，启用：`TP_ENSEMBLE="output/best_model_p1.pth,output/best_model_f1.pth,output/best_model_f2.pth"`
+- **备份**：`_archive/best_v1_2026-09-11/`（权重 + scaler + 代码快照 + 校验和 + 说明）
 
 > ⚠️ **两套版本编号并存，最易混淆**：
 > - **代码内架构编号**：`pinn_lstm.py` 自称 **v3**、`transformer_pi.py` 自称 **v5**
@@ -97,22 +100,33 @@ X_now 3.4972→**0.2114**、X_next 4.3112→**0.3267**（小 16 倍）；旁证�
 
 ## 损失函数
 
-$$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term}^{multi} + \lambda_t \mathcal{L}_{term}^{last} + \lambda_m \mathcal{L}_{align} + \lambda_p \mathcal{L}_{cw} + \lambda_b \mathcal{L}_{bound}$$
+$$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term}^{multi} + \lambda_t \mathcal{L}_{term}^{last} + \lambda_{pos}\mathcal{L}_{pos} + \lambda_m \mathcal{L}_{align} + \lambda_p \mathcal{L}_{cw} + \lambda_b \mathcal{L}_{bound}$$
 
 | 分量 | 终值权重 | warmup |
 |------|---------|--------|
 | `L_Huber`（逐样本，末端>10 km 降权至 0.1、5–10 km 至 0.3） | 1.0 | — |
 | `L_term^multi`（t=3/6/9，权重 0.3/0.5/1.0，÷`TERMINAL_REF_DIST`=4.5） | 0.01→2.0 | 15 ep |
 | `L_term^last`（末步，同样归一化） | 同上 | 15 ep |
-| `L_align`（模型 Δv 对齐 CW 逆推 Δv，PI-LSTM 核心） | 0.001→0.05 | 20 ep |
+| **`L_pos`（物理空间全 10 步位置误差，步长权重 0.2→1.0）** | **0→0.5**（`TP_POS_W`） | 15 ep |
+| `L_align`（模型 Δv 对齐 CW 逆推 Δv，**按 Δv 上限归一化**） | 0.001→0.05 | 20 ep |
 | `L_cw`（CW 单步残差，分维度归一化） | 0→**0.05**（步长修正后重新启用） | 20 ep |
-| `L_bound`（Δv 越界 3 m/s 惩罚） | 0.0005→0.005 | 15 ep |
+| `L_bound`（**归一化超限量** `relu(‖Δv‖/limit−1)`） | 0.0005→0.005 | 15 ep |
 
 前 `PRED_WARMUP_EPOCHS=3` 轮仅用 `L_Huber`。
 
 **改进 C（2026-09-10）**：末端损失原本在物理量纲直接算 3D 距离（~4.0 km），与标准化空间
 `L_Huber`（~0.008）差约 500×，λ_t=2.0 后以 ~1500× 主导梯度 → 数据增强时 loss 爆炸。
 引入 `TERMINAL_REF_DIST=4.5` 归一化后量级降至 ~1.0，训练稳定（train loss 12.6 → 2.81）。
+
+**方向 3（2026-09-11，增益 +4.50%，最大单项）**：新增 `L_pos` 直接监督物理空间 3D 位置误差。
+原因：评估指标是物理空间位置 RMSE，而 `L_Huber` 在标准化空间（位置 std≈50 km、速度 std≈0.05 km/s，
+速度误差被放大），**优化目标与评估口径不一致**。步长权重递增（0.2→1.0）因误差随预测步长增长
+（实测 0.76 → 2.04 km）。
+
+**Δv 类损失的尺度校准（2026-09-10/11）**：`L_align` 与 `L_bound` 均曾因尺度失衡失效——
+km/s 下平方后仅 1e-5（被淹没），改 m/s 又达 4431（主导梯度），最终统一为**按 Δv 上限归一化的
+无量纲形式**。验收判据：CW 逆推脉冲 Δv 均值 **3.52 m/s**（设计值 3 m/s），且 `L_align` 单调下降
+（语义错误时恒定 0.843 不降）。
 
 ## 训练配置
 
@@ -122,8 +136,24 @@ $$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term
 | BATCH_SIZE / EPOCHS | 384 / 80 |
 | EARLY_STOP_PATIENCE | 20（判据 `val_terminal_dist_mean`，**非** val loss） |
 | DROPOUT / 梯度裁剪 | 0.15 / max_norm 1.0 |
+| WEIGHT_DECAY | 1e-5 |
 | 数据集划分 | 70/15/15，seed=42 → 152,349 / 32,646 / 32,647 |
 | RESUME_TRAINING | True（优先 `latest_checkpoint.pth`，回退 `best_model.pth`） |
+| 数据增强 | **关闭**（经核验模型无过拟合，开启反而变差） |
+
+**并行训练与消融的环境变量**（2026-09-11 新增，产物自动加后缀互不干扰）：
+
+| 变量 | 作用 |
+|------|------|
+| `TP_RUN_TAG` | 产物文件名后缀（`best_model_<tag>.pth` / `train_log_<tag>.txt`） |
+| `TP_SEED` | 模型初始化种子（0=随机；数据划分不受影响，由 `load_and_split` 内部固定） |
+| `TP_HIDDEN` / `TP_LAYERS` | PI-LSTM 容量覆盖（默认 384 / 4） |
+| `TP_POS_W` | 位置损失权重的终值 `λ_pos`（默认 0.0 = 不启用） |
+| `TP_ENSEMBLE` | 集成成员路径（逗号分隔），供 `predict.py` 使用 |
+
+> ⚠️ **容量变更会导致旧检查点不可用**（键形状不匹配）。
+> **`strict=False` 会静默保留随机初始化**，故加载不同容量的权重必须按检查点形状
+> 推断架构（见 `utils/ensemble.py::infer_arch`）。
 
 ## 目录约定
 
@@ -134,24 +164,39 @@ $$\mathcal{L} = w_s\mathcal{L}_{Huber} + \tfrac{1}{2}\lambda_t \mathcal{L}_{term
 | `_tools/` | 诊断与对比工具（有效清单见 `_tools/README.md`） |
 | `_experiments/` | v7~v11 消融脚本归档（脚本内路径引用已失效，见其 README） |
 | `_archive/v6_core/` | **v6 体系精简备份**（代码 + 2 个关键权重 + 完整说明） |
-| `_archive/weights/` | 历史权重（backup_v2/v3/v6/v7/v10/v11） |
+| `_archive/best_v1_2026-09-11/` | **★ 当前最优版本备份**（3 个集成成员权重 + scaler + `ensemble_config.json` + 代码快照 + `CHECKSUMS.md5` + README） |
+| `_archive/weights/` | 历史权重（backup_v2/v3/v6/v7/v10/v11 + 各组实验的 best/latest） |
 | `_docs/` | 历史提示词存档与参考文献 |
 | `_rendered/` | 渲染产物 |
 
 ## 评估口径（关键）
 
-**标准口径**：seed=42 验证集（32,646 样本），`td` 对齐 `train.py::validate()` ——
-每样本取「各有效目标末步 3D 距离的**最大值**」再对样本求均值。
+**标准口径**：seed=42 划分（train 152,349 / val 32,646 / test 32,647），
+`td` 对齐 `train.py::validate()` —— 每样本取「各有效目标末步 3D 距离的**最大值**」再对样本求均值。
+
+### 当前最优（2026-09-11，测试集 32,647 样本）
+
+| 方案 | 位置 RMSE | 位置 MAE | 末端距离 |
+|------|----------:|---------:|---------:|
+| 原始基线（384 容量） | 1.3707 km | 0.9423 km | 4.2780 km |
+| 最优单模型 `best_model_f1`（512 + 位置损失） | 1.2958 km | 0.8620 km | 4.2461 km |
+| **集成 `p1 + f1 + f2`（推荐）** | **1.2657 km** | **0.8434 km** | **4.1659 km** |
+| **累计增益** | **+7.66%** | **+10.50%** | **+2.62%** |
+
+> 选择流程：在**验证集**上枚举 91 个子集选组合（val RMSE 1.2726），再在**测试集**报告（1.2657）
+> —— 避免测试集过拟合。工具：`_tools/select_ensemble.py`
+
+### 历史结论（2026-09-10 前，步长修正前的旧模型，**不宜引用**）
 
 | 策略 | td_max | 位置 RMSE |
 |------|-------:|----------:|
-| v6 + v6o 等权集成 | **4.2400 km** | **1.3100 km** |
-| v6o 单独（`_archive/weights/backup_v6/best_model_v6_ep80_td4.294.pth`） | 4.2936 km | 1.3478 km |
-| v6 单独（`output/best_model.pth`） | 4.3171 km | 1.3227 km |
+| v6 + v6o 等权集成 | 4.2400 km | 1.3100 km |
+| v6o 单独 | 4.2936 km | 1.3478 km |
+| v6 单独 | 4.3171 km | 1.3227 km |
 
 > ⚠️ `_tools/ensemble_*.py` 系列的历史结论**不可采信**（评估集是 `Dataset_Summary` 前 5000 个
 > 原始样本，未划分，且 `ensemble_final.py` 有硬编码保存 bug）。请改用
-> `_tools/compare_best.py` 与 `_tools/verify_ensemble.py`。
+> `_tools/eval_ensemble.py` 与 `_tools/select_ensemble.py`。
 
 ## 技术背景
 
@@ -185,7 +230,14 @@ $\Delta v_t = B_{eff}^{+}(x_{t+1} - \Phi_h x_t)$。本项目据此构造可微 �
 | v9 | 输入噪声增强 | loss 爆炸早停 |
 | v10 | hidden=512 + 物理一致增强 | 早停 ep1（4.7567 km） |
 | v11 | 3-seed bagging | 早停 ep1（4.7243 km） |
+| **v12** | **物理计算修正（步长/量纲/语义/尺度）+ 位置损失对齐 + 容量可配置 + 集成** | **当前最优：位置 RMSE 1.2657 km（+7.66%）** |
 
-**结论**：短时序（10 步）任务中 LSTM 显著优于 Transformer；v7~v11 的失败均源于末端损失
-量级失衡（**已由改进 C 修复**，可基于当前主线重试）；全向量化在不改变数学结果的前提下
-将训练速度提升近两个数量级。
+**结论**：
+1. 短时序（10 步）任务中 LSTM 显著优于 Transformer；全向量化在不改变数学结果的前提下
+   将训练速度提升近两个数量级。
+2. **v7~v11 失败有两个独立原因**：① 末端损失量级失衡导致 loss 爆炸（**已由改进 C 修复**）；
+   ② **CW 锚定路线本身不可行** —— 追踪星持续机动，CW 外推基线位置 RMSE 达 120.87 km，
+   比持久基线（17.66 km）还差 6.8 倍。**故 v7 残差学习不应重试**。
+3. **v9/v11（增强与 bagging）在 loss 稳定后可重试**，但需注意：经度量核验模型**几乎无过拟合**
+   （同度量下 val/train = 1.088×），正则化类方法（含噪声增强）预期收益有限甚至为负
+   —— 实测开启增强后位置 RMSE 由 1.3707 恶化到 1.4485 km。
