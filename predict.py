@@ -414,7 +414,7 @@ def main():
     parser.add_argument("--input", type=str, default=None,
                         help="输入 CSV 文件路径（默认使用测试集第一个样本演示）")
     parser.add_argument("--output", type=str, default=None,
-                        help="输出 CSV 文件路径（默认保存到 output/X_pred.csv）")
+                        help="输出 CSV 文件路径（默认保存到 Dataset/X_pred.csv，供 IntentRecognition_V2 消费）")
     parser.add_argument("--model", type=str, default=MODEL_SAVE_PATH,
                         help="模型权重路径")
     parser.add_argument("--scaler", type=str, default=SCALER_SAVE_PATH,
@@ -437,8 +437,10 @@ def main():
 
     output_path = args.output
     if output_path is None:
-        os.makedirs(OUTPUT_DIR, exist_ok=True)
-        output_path = os.path.join(OUTPUT_DIR, "X_pred.csv")
+        # X_pred.csv 是下游 IntentRecognition_V2 的输入，统一存放于工作空间顶层 Dataset/，
+        # 避免各项目各存一份、版本不同步（2026-09-13 归并）
+        os.makedirs(DATA_DIR, exist_ok=True)
+        output_path = os.path.join(DATA_DIR, "X_pred.csv")
 
     ground_truth_path = args.ground_truth
     if ground_truth_path is None:
