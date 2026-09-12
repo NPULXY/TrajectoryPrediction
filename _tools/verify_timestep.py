@@ -22,6 +22,7 @@ sys.path.insert(0, ROOT)
 
 from models.physics_loss import compute_cw_matrix, N_MEAN
 from utils.data_loader import parse_csv
+import config
 
 N_SAMPLES = 3000
 DT_CANDIDATES = [1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 540.0, 600.0]
@@ -48,8 +49,8 @@ def main():
     print(f"时间步长核验（前 {N_SAMPLES} 样本，CW 残差范数）")
     print("=" * 84)
 
-    XN, XM = parse_csv(os.path.join(ROOT, "Dataset_Summary", "X_now.csv"))
-    XN2, _ = parse_csv(os.path.join(ROOT, "Dataset_Summary", "X_next.csv"))
+    XN, XM = parse_csv(os.path.join(config.DATA_DIR, "X_now.csv"))
+    XN2, _ = parse_csv(os.path.join(config.DATA_DIR, "X_next.csv"))
     X = np.stack(XN[:N_SAMPLES])
     Y = np.stack(XN2[:N_SAMPLES])
     M = np.stack(XM[:N_SAMPLES])

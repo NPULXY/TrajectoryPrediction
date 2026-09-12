@@ -19,7 +19,9 @@ _SUFFIX = f"_{RUN_TAG}" if RUN_TAG else ""
 SEED = int(os.environ.get("TP_SEED", "0"))
 
 # ==================== 路径配置 ====================
-DATA_DIR = os.path.join(os.path.dirname(__file__), "Dataset_Summary")
+# 数据集统一存放于工作空间顶层的 Dataset/，各项目共享同一份，避免重复副本（2026-09-13 归并）
+WS_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DATA_DIR = os.path.join(WS_ROOT, "Dataset")
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 MODEL_SAVE_PATH = os.path.join(OUTPUT_DIR, f"best_model{_SUFFIX}.pth")
 CHECKPOINT_SAVE_PATH = os.path.join(OUTPUT_DIR, f"latest_checkpoint{_SUFFIX}.pth")

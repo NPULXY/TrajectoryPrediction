@@ -17,8 +17,8 @@ config.USE_TRANSFORMER = False
 config.D_MODEL = 384  # 实际不影响 PhysicsInformedTrajectoryLSTM
 
 print('加载测试集（前 5000 样本）...')
-XN, XN_masks = parse_csv('Dataset_Summary/X_now.csv')
-XN2, _ = parse_csv('Dataset_Summary/X_next.csv')
+XN, XN_masks = parse_csv(f'{config.DATA_DIR}/X_now.csv')
+XN2, _ = parse_csv(f'{config.DATA_DIR}/X_next.csv')
 X_raw = np.stack(XN[:5000], axis=0)
 Y_raw = np.stack(XN2[:5000], axis=0)
 masks = np.stack(XN_masks[:5000], axis=0)

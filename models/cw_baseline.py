@@ -132,8 +132,8 @@ if __name__ == "__main__":
     print(f'Phi^10_norm[0,3] = {cw.Phi_powers[10, 0, 3]:.4f}')
 
     # 验证 baseline 物理合理性
-    XN, XN_masks = parse_csv('Dataset_Summary/X_now.csv')
-    XN2, _ = parse_csv('Dataset_Summary/X_next.csv')
+    XN, XN_masks = parse_csv(f'{config.DATA_DIR}/X_now.csv')
+    XN2, _ = parse_csv(f'{config.DATA_DIR}/X_next.csv')
     x_init_raw = XN[0][-1].astype(np.float32)  # (24,)
     x_init_norm = scaler.transform(x_init_raw.reshape(1, 1, 24))[0, -1]  # (24,)
     mask = torch.from_numpy(XN_masks[0].reshape(1, 24)).bool()
